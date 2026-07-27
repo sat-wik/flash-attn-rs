@@ -11,6 +11,7 @@
 
 pub mod avx512;
 pub mod naive;
+pub mod roofline;
 pub mod simd;
 pub mod tiled;
 pub mod vexp;
@@ -68,6 +69,23 @@ pub fn max_abs_diff(a: &Mat, b: &Mat) -> f32 {
         .zip(&b.data)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f32::max)
+}
+
+/// Median wall-clock seconds over `iters` timed runs, after three warm-up runs.
+/// Median rather than mean so one descheduled run doesn't skew the result.
+pub fn time_median<F: FnMut()>(mut f: F, iters: usize) -> f64 {
+    use std::time::Instant;
+    for _ in 0..3 {
+        f();
+    }
+    let mut s = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        f();
+        s.push(t.elapsed().as_secs_f64());
+    }
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s[s.len() / 2]
 }
 
 /// FLOPs for one attention pass, for turning wall-clock time into GFLOP/s.

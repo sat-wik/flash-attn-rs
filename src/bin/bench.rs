@@ -1,27 +1,17 @@
 //! Zero-dependency benchmark. `cargo run --release --bin bench`.
 //! Reports median GFLOP/s per kernel across sequence lengths, for both the
 //! full (bidirectional) and causal masks.
+//!
+//! `--json` emits the same measurements as machine-readable JSON, including the
+//! modelled arithmetic intensity of each point. For the roofline figure itself
+//! use the `roofline` binary, which also measures the machine's ceilings.
 
-use flash_attn_rs::{attention_flops, filled, max_abs_diff, naive, simd, tiled};
-use std::time::Instant;
-
-fn time_it<F: Fn()>(f: F, iters: usize) -> f64 {
-    for _ in 0..3 {
-        f();
-    }
-    let mut s = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let t = Instant::now();
-        f();
-        s.push(t.elapsed().as_secs_f64());
-    }
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    s[s.len() / 2]
-}
+use flash_attn_rs::{
+    attention_flops, filled, max_abs_diff, naive, roofline, simd, tiled, time_median,
+};
 
 fn run(causal: bool) {
     let d = 64;
-    let seqs = [128usize, 256, 512, 1024];
     println!(
         "\n=== {} mask, head_dim d = {d} ===",
         if causal { "causal" } else { "full" }
@@ -30,7 +20,7 @@ fn run(causal: bool) {
         "{:>6}  {:>14}  {:>14}  {:>14}  {:>13}",
         "n", "naive GF/s", "tiled GF/s", "simd GF/s", "simd vs naive"
     );
-    for &n in &seqs {
+    for &n in &roofline::SEQ_LENS {
         let q = filled(n, d, 1);
         let k = filled(n, d, 2);
         let v = filled(n, d, 3);
@@ -41,24 +31,10 @@ fn run(causal: bool) {
         assert!(max_abs_diff(&r, &simd::attention(&q, &k, &v, causal)) < 2e-3);
 
         let iters = if n <= 256 { 50 } else { 15 };
-        let tn = time_it(
-            || {
-                naive::attention(&q, &k, &v, causal);
-            },
-            iters,
-        );
-        let tt = time_it(
-            || {
-                tiled::attention(&q, &k, &v, causal);
-            },
-            iters,
-        );
-        let ts = time_it(
-            || {
-                simd::attention(&q, &k, &v, causal);
-            },
-            iters,
-        );
+        let tn = time_median(|| drop(naive::attention(&q, &k, &v, causal)), iters);
+        let tt = time_median(|| drop(tiled::attention(&q, &k, &v, causal)), iters);
+        let ts = time_median(|| drop(simd::attention(&q, &k, &v, causal)), iters);
+
         let g = |t: f64| flops / t / 1e9;
         println!(
             "{:>6}  {:>14.2}  {:>14.2}  {:>14.2}  {:>12.2}x",
@@ -72,6 +48,12 @@ fn run(causal: bool) {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--json") {
+        let machine = roofline::measure_machine();
+        let points = roofline::measure_points();
+        print!("{}", roofline::to_json(&machine, &points));
+        return;
+    }
     run(false);
     run(true);
 }

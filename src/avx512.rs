@@ -4,7 +4,9 @@
 //! toolchains they live behind the unstable `stdsimd` feature, so this whole
 //! module is gated on a `avx512` cfg flag you opt into explicitly:
 //!
-//!     RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo +nightly build --release
+//! ```text
+//! RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo +nightly build --release
+//! ```
 //!
 //! Gating it this way keeps the default `cargo build`/`cargo test` green on
 //! stable while the code stays present and reviewable. The dispatch in
