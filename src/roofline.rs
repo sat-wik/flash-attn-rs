@@ -22,7 +22,7 @@
 //! Both ceilings are *measured on the machine that runs this*, not read off a
 //! spec sheet — see `measure_peak_gflops` and `measure_bandwidth_gbs`.
 
-use crate::{attention_flops, filled, naive, simd, tiled, time_stats};
+use crate::{attention_flops, filled, naive, simd, tiled, time_interleaved};
 use std::time::Instant;
 
 pub const HEAD_DIM: usize = 64;
@@ -340,12 +340,16 @@ pub fn measure_points() -> Vec<Point> {
             let flops = attention_flops(n, d, causal);
             let iters = if n <= 256 { 50 } else { 15 };
 
-            for &kernel in &KERNELS {
-                let t = match kernel {
-                    "naive" => time_stats(|| drop(naive::attention(&q, &k, &v, causal)), iters),
-                    "tiled" => time_stats(|| drop(tiled::attention(&q, &k, &v, causal)), iters),
-                    _ => time_stats(|| drop(simd::attention(&q, &k, &v, causal)), iters),
-                };
+            // Interleaved, not one kernel exhaustively after another: the
+            // speedup between them is the headline number, and measuring the
+            // baseline and the optimized kernel in separate blocks lets machine
+            // drift land entirely in that ratio.
+            let mut f_naive = || drop(naive::attention(&q, &k, &v, causal));
+            let mut f_tiled = || drop(tiled::attention(&q, &k, &v, causal));
+            let mut f_simd = || drop(simd::attention(&q, &k, &v, causal));
+            let timings = time_interleaved(&mut [&mut f_naive, &mut f_tiled, &mut f_simd], iters);
+
+            for (&kernel, t) in KERNELS.iter().zip(&timings) {
                 pts.push(Point {
                     kernel,
                     n,

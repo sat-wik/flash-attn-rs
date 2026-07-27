@@ -7,7 +7,7 @@
 //! use the `roofline` binary, which also measures the machine's ceilings.
 
 use flash_attn_rs::{
-    attention_flops, filled, max_abs_diff, naive, roofline, simd, tiled, time_stats,
+    attention_flops, filled, max_abs_diff, naive, roofline, simd, tiled, time_interleaved,
 };
 
 fn iters_for(n: usize) -> usize {
@@ -38,10 +38,13 @@ fn run(causal: bool) {
         assert!(max_abs_diff(&r, &tiled::attention(&q, &k, &v, causal)) < 1e-4);
         assert!(max_abs_diff(&r, &simd::attention(&q, &k, &v, causal)) < 2e-3);
 
+        // Interleaved so machine drift cannot land entirely in the ratio.
         let iters = iters_for(n);
-        let tn = time_stats(|| drop(naive::attention(&q, &k, &v, causal)), iters);
-        let tt = time_stats(|| drop(tiled::attention(&q, &k, &v, causal)), iters);
-        let ts = time_stats(|| drop(simd::attention(&q, &k, &v, causal)), iters);
+        let mut f_naive = || drop(naive::attention(&q, &k, &v, causal));
+        let mut f_tiled = || drop(tiled::attention(&q, &k, &v, causal));
+        let mut f_simd = || drop(simd::attention(&q, &k, &v, causal));
+        let t = time_interleaved(&mut [&mut f_naive, &mut f_tiled, &mut f_simd], iters);
+        let (tn, tt, ts) = (t[0], t[1], t[2]);
 
         let g = |t: f64| flops / t / 1e9;
         println!(
@@ -75,15 +78,24 @@ fn causal_speedup() {
         let v = filled(n, d, 3);
         let iters = iters_for(n);
         for &kernel in &["tiled", "simd"] {
-            let time_it = |causal: bool| {
+            // The two masks are also interleaved: this ratio is the whole
+            // measurement, so the pair must see the same machine conditions.
+            let mut f_full = || {
                 if kernel == "tiled" {
-                    time_stats(|| drop(tiled::attention(&q, &k, &v, causal)), iters)
+                    drop(tiled::attention(&q, &k, &v, false))
                 } else {
-                    time_stats(|| drop(simd::attention(&q, &k, &v, causal)), iters)
+                    drop(simd::attention(&q, &k, &v, false))
                 }
             };
-            let full = time_it(false);
-            let causal = time_it(true);
+            let mut f_causal = || {
+                if kernel == "tiled" {
+                    drop(tiled::attention(&q, &k, &v, true))
+                } else {
+                    drop(simd::attention(&q, &k, &v, true))
+                }
+            };
+            let t = time_interleaved(&mut [&mut f_full, &mut f_causal], iters);
+            let (full, causal) = (t[0], t[1]);
             println!(
                 "{:>6}  {:>8}  {:>13.3}  {:>15.3}  {:>9.2}x",
                 n,

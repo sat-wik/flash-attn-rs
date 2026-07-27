@@ -98,20 +98,8 @@ pub struct Timing {
     pub spread_pct: f64,
 }
 
-/// Median and spread over `iters` timed runs, after three warm-up runs.
-pub fn time_stats<F: FnMut()>(mut f: F, iters: usize) -> Timing {
-    use std::time::Instant;
-    for _ in 0..3 {
-        f();
-    }
-    let mut s = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let t = Instant::now();
-        f();
-        s.push(t.elapsed().as_secs_f64());
-    }
+fn timing_from(s: &mut [f64]) -> Timing {
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
     let median = s[s.len() / 2];
     let q1 = s[s.len() / 4];
     let q3 = s[(3 * s.len()) / 4];
@@ -124,6 +112,59 @@ pub fn time_stats<F: FnMut()>(mut f: F, iters: usize) -> Timing {
             0.0
         },
     }
+}
+
+/// Median and spread over `iters` timed runs, after three warm-up runs.
+///
+/// Use [`time_interleaved`] instead whenever the result will be *compared* with
+/// another kernel's — see the note there.
+pub fn time_stats<F: FnMut()>(mut f: F, iters: usize) -> Timing {
+    use std::time::Instant;
+    for _ in 0..3 {
+        f();
+    }
+    let mut s = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        f();
+        s.push(t.elapsed().as_secs_f64());
+    }
+    timing_from(&mut s)
+}
+
+/// Time several closures round-robin instead of one exhaustively after another.
+///
+/// Timing kernel A fifty times and *then* kernel B fifty times measures the two
+/// under different conditions. On a shared machine the available throughput
+/// drifts between the blocks, and the ratio — which is the headline number —
+/// absorbs that drift whole. Measured this way on an oversubscribed vCPU, the
+/// same speedup came out anywhere from 4.2x to 8.3x across two back-to-back
+/// runs, and almost all of the movement was in the baseline rather than the
+/// optimized kernel.
+///
+/// Interleaving turns it into a paired comparison: inside one round every
+/// kernel sees the same neighbours, the same clock and the same contention, so
+/// drift moves them together and largely cancels in the ratio. The starting
+/// position rotates each round, so no kernel systematically pays for running
+/// first into a cold cache.
+pub fn time_interleaved(fs: &mut [&mut dyn FnMut()], rounds: usize) -> Vec<Timing> {
+    use std::time::Instant;
+    let k = fs.len();
+    for f in fs.iter_mut() {
+        for _ in 0..3 {
+            f();
+        }
+    }
+    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); k];
+    for r in 0..rounds {
+        for off in 0..k {
+            let i = (r + off) % k;
+            let t = Instant::now();
+            fs[i]();
+            samples[i].push(t.elapsed().as_secs_f64());
+        }
+    }
+    samples.iter_mut().map(|s| timing_from(s)).collect()
 }
 
 /// FLOPs for one attention pass, for turning wall-clock time into GFLOP/s.
