@@ -114,3 +114,7 @@ src/bin/bench.rs standalone benchmark (both masks)
 benches/         criterion harness
 tests/           correctness vs naive, both masks
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
