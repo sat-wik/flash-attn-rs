@@ -111,8 +111,8 @@ unsafe fn attention_avx2(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
         q0 = q1;
     }
 
-    for i in 0..n {
-        let denom = if l[i] == 0.0 { 1.0 } else { l[i] };
+    for (i, &li) in l.iter().enumerate() {
+        let denom = if li == 0.0 { 1.0 } else { li };
         scale_avx2(out.row_mut(i), 1.0 / denom);
     }
     out

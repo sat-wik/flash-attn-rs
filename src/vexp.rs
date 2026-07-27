@@ -11,6 +11,11 @@
 //! This is only ever called on the post-max-subtraction values (x <= 0 in
 //! softmax), but it's correct for the general small-to-moderate range too.
 
+/// # Safety
+///
+/// The caller must have established that the CPU supports AVX2 and FMA (e.g.
+/// via `is_x86_feature_detected!`). Executing this on a CPU without them is
+/// undefined behaviour.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {

@@ -23,6 +23,11 @@
 use crate::Mat;
 
 /// 16-wide dot product with FMA and a single-instruction horizontal reduction.
+///
+/// # Safety
+///
+/// The caller must have established that the CPU supports AVX-512F (e.g. via
+/// `is_x86_feature_detected!`). Executing this without it is undefined behaviour.
 #[target_feature(enable = "avx512f")]
 pub unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -44,6 +49,10 @@ pub unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// out += p * v, 16-wide.
+///
+/// # Safety
+///
+/// The caller must have established that the CPU supports AVX-512F.
 #[target_feature(enable = "avx512f")]
 pub unsafe fn axpy_avx512(out: &mut [f32], v: &[f32], p: f32) {
     use std::arch::x86_64::*;
@@ -66,6 +75,10 @@ pub unsafe fn axpy_avx512(out: &mut [f32], v: &[f32], p: f32) {
 /// 16-wide primitives above. Left as a thin wrapper here so the module compiles
 /// standalone under the `avx512` cfg; wire it into `simd::attention`'s dispatch
 /// when building on nightly.
+///
+/// # Safety
+///
+/// The caller must have established that the CPU supports AVX-512F.
 #[target_feature(enable = "avx512f")]
 pub unsafe fn attention(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
     // The structure is identical to the AVX2 kernel; only the lane width and the
