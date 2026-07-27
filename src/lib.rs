@@ -71,9 +71,22 @@ pub fn max_abs_diff(a: &Mat, b: &Mat) -> f32 {
         .fold(0.0, f32::max)
 }
 
-/// Median wall-clock seconds over `iters` timed runs, after three warm-up runs.
-/// Median rather than mean so one descheduled run doesn't skew the result.
-pub fn time_median<F: FnMut()>(mut f: F, iters: usize) -> f64 {
+/// Wall-clock result for one timed kernel.
+#[derive(Clone, Copy)]
+pub struct Timing {
+    /// Median seconds per run.
+    pub median: f64,
+    /// Interquartile range as a percentage of the median.
+    ///
+    /// This is the answer to "how repeatable is that number?", which a single
+    /// median cannot give you. IQR rather than min/max because one descheduled
+    /// run on a shared machine should not define the error bar, and reporting it
+    /// at all is what lets a reader tell a real effect from timing noise.
+    pub spread_pct: f64,
+}
+
+/// Median and spread over `iters` timed runs, after three warm-up runs.
+pub fn time_stats<F: FnMut()>(mut f: F, iters: usize) -> Timing {
     use std::time::Instant;
     for _ in 0..3 {
         f();
@@ -85,7 +98,18 @@ pub fn time_median<F: FnMut()>(mut f: F, iters: usize) -> f64 {
         s.push(t.elapsed().as_secs_f64());
     }
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    s[s.len() / 2]
+
+    let median = s[s.len() / 2];
+    let q1 = s[s.len() / 4];
+    let q3 = s[(3 * s.len()) / 4];
+    Timing {
+        median,
+        spread_pct: if median > 0.0 {
+            (q3 - q1) / median * 100.0
+        } else {
+            0.0
+        },
+    }
 }
 
 /// FLOPs for one attention pass, for turning wall-clock time into GFLOP/s.

@@ -60,13 +60,18 @@ comes from one run of the committed generator.
 
 ```
 cargo run --release --bin roofline   # regenerates the figure above + its JSON
-cargo run --release --bin bench      # zero-dep, stable Rust, both masks
+cargo run --release --bin bench      # both masks, plus measured causal speedup
 cargo bench                          # criterion, with plots
 cargo test --release                 # correctness vs naive, both masks
 ```
 Reproduce with `RUSTFLAGS="-C target-cpu=native"`. The roofline binary measures
 both ceilings on whatever machine runs it, stamps the figure with that machine,
 and refuses to be quiet about it if the host was too contended to trust.
+
+Every timing is a median over 15–50 runs after warm-up, and every point carries
+its interquartile spread — in `docs/roofline.json` per point, and on the figure
+as the worst case across all of them. A median with no spread beside it cannot
+tell you whether a difference is real, so this reports both.
 
 ## What the numbers say
 
@@ -103,13 +108,26 @@ the tail of every dot product, the scalar softmax bookkeeping between blocks,
 and per-block loop overhead, none of which vectorize. That is a roofline
 argument for where to look next, not a mystery.
 
-**Causal masking is worth roughly 2× in wall-clock.** The tiled kernels skip any
-KV block lying entirely above the diagonal, touching only the lower-triangular
-half of the score space. Derived from the committed measurements, full-mask time
-divided by causal time runs 1.5–2.1× across sizes (the spread is run-to-run
-noise on a shared vCPU), against the 2.0× you would predict from halving the
-query–key pairs. Note this does *not* show up in the GFLOP/s tables, which
-already normalize it away by counting only unmasked pairs.
+**Causal block-skipping pays, and the GFLOP/s tables cannot show it.** Those
+tables divide by a causal-aware FLOP count, which normalizes the halved work
+straight back out — so the only way to see what the block-skip is worth is a
+stopwatch on the same kernel under both masks. `cargo run --release --bin bench`
+does exactly that and prints the ratio against the ideal 2.0× you would predict
+from the causal mask leaving n(n+1)/2 of n² query–key pairs. The per-point
+median wall-clock is also in `docs/roofline.json`, so the ratio is checkable
+without rerunning anything.
+
+**The naive baseline cannot exploit the mask, and the data shows it.** Naive's
+causal throughput runs 11–28% *below* its own full-mask throughput — look at the
+orange points, which sit lower under the causal mask despite the FLOP count
+already accounting for the halved work. That is structural, not noise. The
+softmax pass in `src/naive.rs` walks the entire n-wide row whatever the mask,
+and the masking step writes `-inf` across the whole upper triangle, so the
+kernel pays O(n²) even when only half the pairs matter. Materializing the score
+matrix does not just cost memory traffic; it forces you to touch entries you
+have already decided to throw away. The tiled kernels skip those blocks and
+never pay for them, which is the clearest single argument in the project for the
+flash formulation.
 
 ## AVX-512 (nightly)
 

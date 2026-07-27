@@ -22,7 +22,7 @@
 //! Both ceilings are *measured on the machine that runs this*, not read off a
 //! spec sheet — see `measure_peak_gflops` and `measure_bandwidth_gbs`.
 
-use crate::{attention_flops, filled, naive, simd, tiled, time_median};
+use crate::{attention_flops, filled, naive, simd, tiled, time_stats};
 use std::time::Instant;
 
 pub const HEAD_DIM: usize = 64;
@@ -37,6 +37,12 @@ pub struct Point {
     pub gflops: f64,
     /// FLOPs per byte moved, from the traffic model in `bytes_moved`.
     pub intensity: f64,
+    /// Median seconds per run. Emitted so the causal-vs-full wall-clock ratio is
+    /// a division of two committed measurements rather than something inferred
+    /// from GFLOP/s and a FLOP count.
+    pub median_secs: f64,
+    /// Interquartile spread of the timing, as a percentage of the median.
+    pub spread_pct: f64,
 }
 
 /// The machine's two ceilings, plus enough identity to make the figure
@@ -332,17 +338,19 @@ pub fn measure_points() -> Vec<Point> {
             let iters = if n <= 256 { 50 } else { 15 };
 
             for &kernel in &KERNELS {
-                let secs = match kernel {
-                    "naive" => time_median(|| drop(naive::attention(&q, &k, &v, causal)), iters),
-                    "tiled" => time_median(|| drop(tiled::attention(&q, &k, &v, causal)), iters),
-                    _ => time_median(|| drop(simd::attention(&q, &k, &v, causal)), iters),
+                let t = match kernel {
+                    "naive" => time_stats(|| drop(naive::attention(&q, &k, &v, causal)), iters),
+                    "tiled" => time_stats(|| drop(tiled::attention(&q, &k, &v, causal)), iters),
+                    _ => time_stats(|| drop(simd::attention(&q, &k, &v, causal)), iters),
                 };
                 pts.push(Point {
                     kernel,
                     n,
                     causal,
-                    gflops: flops / secs / 1e9,
+                    gflops: flops / t.median / 1e9,
                     intensity: flops / bytes_moved(kernel, n, d, causal),
+                    median_secs: t.median,
+                    spread_pct: t.spread_pct,
                 });
             }
         }
@@ -371,12 +379,14 @@ pub fn to_json(m: &Machine, pts: &[Point]) -> String {
     s.push_str("  \"points\": [\n");
     for (i, p) in pts.iter().enumerate() {
         s.push_str(&format!(
-            "    {{ \"kernel\": \"{}\", \"n\": {}, \"mask\": \"{}\", \"gflops\": {:.4}, \"intensity_flop_per_byte\": {:.4} }}{}\n",
+            "    {{ \"kernel\": \"{}\", \"n\": {}, \"mask\": \"{}\", \"gflops\": {:.4}, \"intensity_flop_per_byte\": {:.4}, \"median_secs\": {:.9}, \"spread_pct\": {:.2} }}{}\n",
             p.kernel,
             p.n,
             if p.causal { "causal" } else { "full" },
             p.gflops,
             p.intensity,
+            p.median_secs,
+            p.spread_pct,
             if i + 1 == pts.len() { "" } else { "," }
         ));
     }
@@ -496,9 +506,13 @@ pub fn to_svg(m: &Machine, pts: &[Point]) -> String {
         "<text x=\"{L:.0}\" y=\"50\" font-size=\"12\" fill=\"#475569\">measured on {} — {}</text>\n",
         m.arch, m.isa
     ));
+    let worst_spread = pts.iter().map(|p| p.spread_pct).fold(0.0, f64::max);
     s.push_str(&format!(
-        "<text x=\"{L:.0}\" y=\"68\" font-size=\"11.5\" fill=\"#64748b\">compute ceiling {:.0} GFLOP/s  ·  bandwidth {:.1} GB/s  ·  ridge {:.2} FLOP/byte</text>\n",
-        m.peak_gflops, m.bandwidth_gbs, m.ridge()
+        "<text x=\"{L:.0}\" y=\"68\" font-size=\"11.5\" fill=\"#64748b\">compute ceiling {:.0} GFLOP/s  ·  bandwidth {:.1} GB/s  ·  ridge {:.2} FLOP/byte  ·  worst point spread {:.0}%</text>\n",
+        m.peak_gflops,
+        m.bandwidth_gbs,
+        m.ridge(),
+        worst_spread
     ));
 
     // Grid + ticks.
