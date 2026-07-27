@@ -13,6 +13,15 @@ use crate::{tiled, Mat};
 pub fn attention(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
     #[cfg(target_arch = "x86_64")]
     {
+        // Widest first. This arm only exists when built with `--cfg avx512`;
+        // the feature test still runs, so a binary built with the cfg stays
+        // correct on a CPU that lacks AVX-512 and simply falls through.
+        #[cfg(avx512)]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                return unsafe { crate::avx512::attention(q, k, v, causal) };
+            }
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { attention_avx2(q, k, v, causal) };
         }

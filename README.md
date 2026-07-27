@@ -113,17 +113,34 @@ already normalize it away by counting only unmasked pairs.
 
 ## AVX-512 (nightly)
 
-`src/avx512.rs` implements 16-wide `dot`/`axpy` with a hardware
-`_mm512_reduce_add_ps`. Build:
+`src/avx512.rs` carries the full 16-wide kernel — the same online-softmax
+bookkeeping and causal block-skipping as the AVX2 path, over `_mm512_*`
+primitives with a hardware `_mm512_reduce_add_ps` and a 16-wide `exp`
+(`vexp::exp16`). It is wired into `simd::attention`'s runtime dispatch ahead of
+the AVX2 arm, so a binary built with the cfg picks AVX-512 when the CPU has it
+and falls through cleanly when it doesn't.
 
 ```
 RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo +nightly build --release
 ```
 
-Expected gain over AVX2 is **sub-2×**, not 2×: the reduction and scalar softmax
-tail don't widen, and some parts down-clock under sustained AVX-512 load. That
-frequency-throttling crossover — where wider vectors stop paying — is the thing
-worth measuring on the actual target part rather than assuming.
+The module is gated because `_mm512_*` only stabilized in Rust 1.89 and the
+default build targets an older floor — nothing outside the cfg needs a new
+toolchain.
+
+**No performance numbers here, because I have not run this on a part with
+AVX-512.** The kernel is compiled and lint-clean under the cfg, and CI builds
+and tests it on nightly, but every machine I have access to tops out at AVX2, so
+the correctness test skips itself rather than pretend to cover something it
+didn't.
+
+What I'd *expect*, and would want to check against measurement: **sub-2×** over
+AVX2, not the 2× the lane count suggests. The per-dot-product reduction and the
+scalar softmax bookkeeping between blocks don't widen, and they're already the
+binding constraint at 17% of peak. Against that, some parts down-clock under
+sustained AVX-512 load, which can erase the gain entirely. That crossover —
+where wider vectors stop paying — is the measurement worth making, and it is
+explicitly projected, not observed.
 
 ## Next steps
 

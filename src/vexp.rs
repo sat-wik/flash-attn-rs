@@ -59,3 +59,61 @@ pub unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 
     _mm256_mul_ps(p, pow2k)
 }
+
+/// 16-wide sibling of [`exp8`]: identical range reduction, identical degree-5
+/// polynomial, identical exponent assembly — only the lane count changes. Kept
+/// as a separate function rather than a generic because the two intrinsic
+/// families share no trait, and the duplication is worth less than the
+/// indirection would cost inside the softmax inner loop.
+///
+/// One deliberate difference: where the AVX2 path rounds with
+/// `_mm256_round_ps` and then converts, this converts straight to i32.
+/// `_mm512_cvtps_epi32` rounds to nearest-even under the default MXCSR mode,
+/// which is what the AVX2 pair computes, so the two agree lane for lane.
+///
+/// # Safety
+///
+/// The caller must have established that the CPU supports AVX-512F (e.g. via
+/// `is_x86_feature_detected!`). Executing this without it is undefined
+/// behaviour.
+#[cfg(all(target_arch = "x86_64", avx512))]
+// Stable since 1.89, above the crate MSRV — same opt-in reasoning as `avx512.rs`.
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn exp16(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
+    use std::arch::x86_64::*;
+
+    let ln2 = _mm512_set1_ps(std::f32::consts::LN_2);
+    let inv_ln2 = _mm512_set1_ps(std::f32::consts::LOG2_E);
+
+    // Clamp so the exponent assembly below cannot overflow the field.
+    let hi = _mm512_set1_ps(88.0);
+    let lo = _mm512_set1_ps(-88.0);
+    let x = _mm512_max_ps(_mm512_min_ps(x, hi), lo);
+
+    // k = round(x / ln2), r = x - k*ln2, so |r| <= ln2/2.
+    let ki = _mm512_cvtps_epi32(_mm512_mul_ps(x, inv_ln2));
+    let kf = _mm512_cvtepi32_ps(ki);
+    let r = _mm512_fnmadd_ps(kf, ln2, x);
+
+    // exp(r) by Horner on the reduced range.
+    let c5 = _mm512_set1_ps(1.0 / 120.0);
+    let c4 = _mm512_set1_ps(1.0 / 24.0);
+    let c3 = _mm512_set1_ps(1.0 / 6.0);
+    let c2 = _mm512_set1_ps(0.5);
+    let c1 = _mm512_set1_ps(1.0);
+    let c0 = _mm512_set1_ps(1.0);
+    let mut p = c5;
+    p = _mm512_fmadd_ps(p, r, c4);
+    p = _mm512_fmadd_ps(p, r, c3);
+    p = _mm512_fmadd_ps(p, r, c2);
+    p = _mm512_fmadd_ps(p, r, c1);
+    p = _mm512_fmadd_ps(p, r, c0);
+
+    // 2^k, built by adding the bias and shifting into the IEEE-754 exponent.
+    let bias = _mm512_set1_epi32(127);
+    let exp_field = _mm512_slli_epi32::<23>(_mm512_add_epi32(ki, bias));
+    let pow2k = _mm512_castsi512_ps(exp_field);
+
+    _mm512_mul_ps(p, pow2k)
+}
