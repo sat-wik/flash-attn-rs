@@ -25,11 +25,37 @@ fn main() -> std::io::Result<()> {
     std::io::stderr().flush()?;
     let machine = roofline::measure_machine();
     eprintln!(
-        "{:.1} GFLOP/s, {:.1} GB/s (ridge {:.2} FLOP/byte)",
+        "{:.1} GFLOP/s (+/-{:.1}%), {:.1} GB/s (+/-{:.1}%), ridge {:.2} FLOP/byte",
         machine.peak_gflops,
+        machine.peak_spread_pct,
         machine.bandwidth_gbs,
+        machine.bandwidth_spread_pct,
         machine.ridge()
     );
+
+    // A ceiling measured on a contended host is not a ceiling. Say so loudly
+    // rather than emitting a figure that looks authoritative and isn't.
+    if machine.peak_spread_pct > roofline::COMPUTE_NOISE_WARN_PCT {
+        eprintln!(
+            "\nWARNING: the compute ceiling varied by {:.1}% across runs (limit {:.0}%).\n\
+             That probe is a pure register loop, so it should repeat to within a\n\
+             percent or two on a core it actually owns. This much spread means time\n\
+             is being stolen — an oversubscribed vCPU, a noisy neighbour, or thermal\n\
+             throttling. The ceiling is understated and the figure is not worth\n\
+             committing. Re-run on a quiet or dedicated machine.",
+            machine.peak_spread_pct,
+            roofline::COMPUTE_NOISE_WARN_PCT
+        );
+    }
+    if machine.bandwidth_spread_pct > roofline::BANDWIDTH_NOISE_WARN_PCT {
+        eprintln!(
+            "\nWARNING: the bandwidth ceiling varied by {:.1}% across runs (limit {:.0}%).\n\
+             Some swing is normal here, but this much means something else on the box\n\
+             is moving a lot of memory. The ridge point will be off. Re-run when idle.",
+            machine.bandwidth_spread_pct,
+            roofline::BANDWIDTH_NOISE_WARN_PCT
+        );
+    }
 
     eprint!("timing kernels... ");
     std::io::stderr().flush()?;

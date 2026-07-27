@@ -46,6 +46,35 @@ pub struct Machine {
     pub isa: String,
     pub peak_gflops: f64,
     pub bandwidth_gbs: f64,
+    /// Sample spread for each ceiling, as a percentage of the best sample. On a
+    /// quiet dedicated core this is a couple of percent. A large spread means
+    /// the host was contended — a shared vCPU losing time to a neighbour, or
+    /// thermal throttling — and the ceiling is not worth plotting against.
+    pub peak_spread_pct: f64,
+    pub bandwidth_spread_pct: f64,
+}
+
+/// Spread thresholds past which `roofline` warns that the host was too noisy.
+///
+/// The two ceilings deserve different limits. The compute probe is a pure
+/// register loop that touches no memory, so on a machine with a core to itself
+/// it repeats to within a percent or two — which makes it a sharp detector of
+/// stolen time on a shared vCPU. The bandwidth probe contends with the page
+/// cache, DRAM refresh and every other process on the box, so 10-20% swing is
+/// ordinary even on a quiet machine and only a much larger spread is alarming.
+pub const COMPUTE_NOISE_WARN_PCT: f64 = 10.0;
+pub const BANDWIDTH_NOISE_WARN_PCT: f64 = 25.0;
+
+/// Best and worst of a set of samples, reduced to (best, spread %).
+fn summarize(samples: &[f64]) -> (f64, f64) {
+    let best = samples.iter().copied().fold(0.0, f64::max);
+    let worst = samples.iter().copied().fold(f64::MAX, f64::min);
+    let spread = if best > 0.0 {
+        (best - worst) / best * 100.0
+    } else {
+        0.0
+    };
+    (best, spread)
 }
 
 impl Machine {
@@ -115,7 +144,7 @@ pub fn bytes_moved(kernel: &str, n: usize, d: usize, causal: bool) -> f64 {
 /// reports is what the FMA units actually retire on this part — including any
 /// clock the part drops under sustained vector load. That makes it a fairer
 /// ceiling than `cores * clock * lanes * 2`, which no real code reaches.
-pub fn measure_peak_gflops() -> f64 {
+pub fn measure_peak_gflops() -> (f64, f64) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -140,12 +169,19 @@ const PEAK_WIDTH: usize = 64;
 /// without a hand-tuned iteration count for each.
 const MIN_SECS: f64 = 0.25;
 
-fn peak_portable() -> f64 {
+/// A ceiling is a *best case*, so every probe takes the fastest of several runs
+/// rather than one sample. This matters most on shared or virtualized hosts,
+/// where an unlucky sample includes a neighbour's steal time and drags the roof
+/// below the kernels it is supposed to bound.
+const REPEATS: usize = 5;
+
+fn peak_portable() -> (f64, f64) {
     let a = std::hint::black_box(1.000_000_1f32);
     let b = std::hint::black_box(0.999_999_9f32);
     let mut acc = [1.0f32; PEAK_WIDTH];
 
     let mut batches: u64 = 1 << 12;
+    let mut samples = Vec::with_capacity(REPEATS);
     loop {
         let t = Instant::now();
         for _ in 0..batches {
@@ -155,11 +191,16 @@ fn peak_portable() -> f64 {
         }
         let secs = t.elapsed().as_secs_f64();
         std::hint::black_box(acc);
-        if secs >= MIN_SECS {
-            // One FMA is two FLOPs.
-            return (batches as f64) * (PEAK_WIDTH as f64) * 2.0 / secs / 1e9;
+
+        if secs < MIN_SECS {
+            batches *= 4;
+            continue;
         }
-        batches *= 4;
+        // One FMA is two FLOPs.
+        samples.push((batches as f64) * (PEAK_WIDTH as f64) * 2.0 / secs / 1e9);
+        if samples.len() == REPEATS {
+            return summarize(&samples);
+        }
     }
 }
 
@@ -168,9 +209,9 @@ fn peak_portable() -> f64 {
 /// The caller must have established that the CPU supports AVX2 and FMA.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn peak_avx2() -> f64 {
+unsafe fn peak_avx2() -> (f64, f64) {
     use std::arch::x86_64::*;
-    // Same total lane count as the portable probe: 4 vectors x 8 f32.
+    // Same total lane count as the portable probe: 8 vectors x 8 f32.
     const VECS: usize = PEAK_WIDTH / 8;
 
     let a = _mm256_set1_ps(1.000_000_1);
@@ -178,6 +219,7 @@ unsafe fn peak_avx2() -> f64 {
     let mut acc = [_mm256_set1_ps(1.0); VECS];
 
     let mut batches: u64 = 1 << 12;
+    let mut samples = Vec::with_capacity(REPEATS);
     loop {
         let t = Instant::now();
         for _ in 0..batches {
@@ -194,11 +236,15 @@ unsafe fn peak_avx2() -> f64 {
             std::hint::black_box(sink);
         }
 
-        if secs >= MIN_SECS {
-            // 8 lanes per vector, two FLOPs per FMA.
-            return (batches as f64) * (VECS as f64) * 16.0 / secs / 1e9;
+        if secs < MIN_SECS {
+            batches *= 4;
+            continue;
         }
-        batches *= 4;
+        // 8 lanes per vector, two FLOPs per FMA.
+        samples.push((batches as f64) * (VECS as f64) * 16.0 / secs / 1e9);
+        if samples.len() == REPEATS {
+            return summarize(&samples);
+        }
     }
 }
 
@@ -208,7 +254,7 @@ unsafe fn peak_avx2() -> f64 {
 /// last-level cache, so the number reflects DRAM rather than cache. Counts the
 /// three logical streams STREAM counts; on most parts the write also incurs a
 /// read-for-ownership, so this is a conservative lower bound on real traffic.
-pub fn measure_bandwidth_gbs() -> f64 {
+pub fn measure_bandwidth_gbs() -> (f64, f64) {
     // 64 MB per buffer, 192 MB total — comfortably past any current LLC.
     const N: usize = 16 << 20;
     let mut a = vec![0.0f32; N];
@@ -216,20 +262,21 @@ pub fn measure_bandwidth_gbs() -> f64 {
     let c = vec![2.0f32; N];
     let s = std::hint::black_box(3.0f32);
 
-    triad(&mut a, &b, &c, s); // fault the pages in
+    // Two warm-up passes, not one: the first faults 192 MB of pages in, and the
+    // second settles the TLB. Timing either of them makes a quiet machine look
+    // contended.
+    triad(&mut a, &b, &c, s);
+    triad(&mut a, &b, &c, s);
 
-    let mut best = 0.0f64;
-    for _ in 0..3 {
+    let mut samples = Vec::with_capacity(REPEATS);
+    for _ in 0..REPEATS {
         let t = Instant::now();
         triad(&mut a, &b, &c, s);
         let secs = t.elapsed().as_secs_f64();
         std::hint::black_box(&a);
-        let gbs = 3.0 * N as f64 * 4.0 / secs / 1e9;
-        if gbs > best {
-            best = gbs;
-        }
+        samples.push(3.0 * N as f64 * 4.0 / secs / 1e9);
     }
-    best
+    summarize(&samples)
 }
 
 fn triad(a: &mut [f32], b: &[f32], c: &[f32], s: f32) {
@@ -259,11 +306,15 @@ pub fn detected_isa() -> String {
 }
 
 pub fn measure_machine() -> Machine {
+    let (peak_gflops, peak_spread_pct) = measure_peak_gflops();
+    let (bandwidth_gbs, bandwidth_spread_pct) = measure_bandwidth_gbs();
     Machine {
         arch: std::env::consts::ARCH,
         isa: detected_isa(),
-        peak_gflops: measure_peak_gflops(),
-        bandwidth_gbs: measure_bandwidth_gbs(),
+        peak_gflops,
+        bandwidth_gbs,
+        peak_spread_pct,
+        bandwidth_spread_pct,
     }
 }
 
@@ -307,8 +358,14 @@ pub fn to_json(m: &Machine, pts: &[Point]) -> String {
     let mut s = String::new();
     s.push_str("{\n");
     s.push_str(&format!(
-        "  \"machine\": {{ \"arch\": \"{}\", \"isa\": \"{}\", \"peak_gflops\": {:.3}, \"bandwidth_gbs\": {:.3}, \"ridge_flop_per_byte\": {:.4} }},\n",
-        m.arch, m.isa, m.peak_gflops, m.bandwidth_gbs, m.ridge()
+        "  \"machine\": {{ \"arch\": \"{}\", \"isa\": \"{}\", \"peak_gflops\": {:.3}, \"bandwidth_gbs\": {:.3}, \"ridge_flop_per_byte\": {:.4}, \"peak_spread_pct\": {:.2}, \"bandwidth_spread_pct\": {:.2} }},\n",
+        m.arch,
+        m.isa,
+        m.peak_gflops,
+        m.bandwidth_gbs,
+        m.ridge(),
+        m.peak_spread_pct,
+        m.bandwidth_spread_pct
     ));
     s.push_str(&format!("  \"head_dim\": {},\n", HEAD_DIM));
     s.push_str("  \"points\": [\n");
