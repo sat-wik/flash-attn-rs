@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stable:
+    name: stable — fmt, clippy, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --release
+
+      # No -C target-cpu=native here: runners differ, and the point of CI is to
+      # prove the portable path. simd::attention's is_x86_feature_detected!
+      # dispatch picks AVX2 only if the runner actually has it, and falls back
+      # to the scalar tiled kernel otherwise. Native flags are for local benching.
+      - name: cargo test
+        run: cargo test --release
+
+  nightly-avx512:
+    name: nightly — avx512 compile check
+    runs-on: ubuntu-latest
+    # Advisory only: nightly toolchain drift must not block the repo.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      # Compile-only. Whether the kernel *runs* depends on the runner having
+      # AVX-512, which is not guaranteed; this job just guards that the cfg-gated
+      # module keeps compiling.
+      - name: cargo build (--cfg avx512)
+        env:
+          RUSTFLAGS: --cfg avx512
+        run: cargo build --release

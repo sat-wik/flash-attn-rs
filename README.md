@@ -1,5 +1,7 @@
 # flash-attn-rs
 
+[![CI](https://github.com/sat-wik/flash-attn-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sat-wik/flash-attn-rs/actions/workflows/ci.yml)
+
 Hand-optimized single-head attention kernels in Rust, built to make the
 *hardware reason* for each speedup measurable and explainable — not to beat
 cuDNN. Three implementations of the same math, with causal masking and a
