@@ -53,7 +53,15 @@ jobs:
       # check can be read correctly: with avx512f the kernel really ran, without
       # it only the fallback did.
       - name: runner AVX-512 support
-        run: grep -o 'avx512[a-z0-9]*' /proc/cpuinfo | sort -u || echo "none — kernel will be compiled but not executed"
+        run: |
+          # Note: `grep ... | sort || echo` would never reach the echo, since the
+          # pipeline takes sort's exit status and sort succeeds on empty input.
+          flags=$(grep -o 'avx512[a-z0-9]*' /proc/cpuinfo | sort -u | tr '\n' ' ')
+          if [ -n "$flags" ]; then
+            echo "runner HAS AVX-512 ($flags) — the kernel is executed by the tests below"
+          else
+            echo "runner has NO AVX-512 — the kernel is built and type-checked, but avx512_matches_naive will skip"
+          fi
 
       - name: cargo build (--cfg avx512)
         run: cargo build --release
