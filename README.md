@@ -68,6 +68,8 @@ number would not survive a rerun, and the range is the honest claim.
 
 ```
 cargo run --release --bin roofline   # regenerates the figure above + its JSON
+cargo run --release --bin roofline -- --from-json docs/roofline.json   # re-render only
+cargo run --release --bin blocksweep # tile size vs throughput
 cargo run --release --bin bench      # both masks, plus measured causal speedup
 cargo bench                          # criterion, with plots
 cargo test --release                 # correctness vs naive, both masks
@@ -94,7 +96,7 @@ worst-case on the figure.
 
 **Everything here is compute-bound, and that is the whole story.** The ridge
 point on this machine — where the bandwidth ceiling crosses the compute ceiling
-— sits at 5.25 FLOP/byte. Every kernel at every size lands to the *right* of it,
+— sits at 4.84 FLOP/byte. Every kernel at every size lands to the *right* of it,
 between 8 and 30 FLOP/byte. Nothing in this workload is waiting on memory, so
 moving fewer bytes cannot be the lever that makes it faster. That single fact
 predicts the rest of the table.
@@ -113,20 +115,34 @@ win needs larger `n`, smaller cache, or the HBM-bound GPU regime it was designed
 for.
 
 **Vectorization is the lever that actually applies.** Being compute-bound means
-the way up is issuing better instructions, and that is what AVX2 does — 4.8–6.4×,
-moving the points vertically rather than horizontally. Most of it is the
-8-wide dot product and accumulate; the last stretch came from replacing the
-per-score scalar `exp` with an 8-wide polynomial (`src/vexp.rs`), which had been
-the binding constraint on the softmax.
+the way up is issuing better instructions, and that is what AVX2 does — roughly
+4–5.5×, moving the points vertically rather than horizontally. Most of it is the
+8-wide dot product and accumulate. Two further steps came from following the
+roofline rather than guessing: replacing the per-score scalar `exp` with an
+8-wide polynomial (`src/vexp.rs`), which had been the binding constraint on the
+softmax, and then amortizing the dot-product reduction (`dot4_avx2`) — see
+below.
 
-**And there is still 4.5× left on the table.** The best kernel reaches 17.2 of
-78.9 GFLOP/s — about 22% of measured peak. That ceiling is itself worth trusting:
-it comes from a dependency-free FMA probe, repeats to 2.7% across seven runs, and
-works out to ~100% of what two 256-bit FMA ports can retire at this core's clock,
-so it is a real ceiling rather than a round number. The remaining gap is the
-horizontal reduction at the tail of every dot product, the scalar softmax
-bookkeeping between blocks, and per-block loop overhead, none of which vectorize.
-That is a roofline argument for where to look next, not a mystery.
+**And there is still ~4.5× left on the table — but the roofline says where.**
+The best kernel reaches 17.2 of 78.9 GFLOP/s, about 22% of measured peak. That
+ceiling is worth trusting: a dependency-free FMA probe, repeatable to 2.7% across
+seven runs, working out to ~100% of what two 256-bit FMA ports can retire at this
+core's clock. So the gap is real, and it is not in the FMAs — it is in everything
+around them that does not vectorize.
+
+The largest single item was the **horizontal reduction**. An 8-wide dot product
+ends with `extractf128 + add + hadd + hadd`, which is serial, uses no FMA unit,
+and costs the same whether the vector body was 8 elements or 64. At `d = 64`
+that tail ran once per query-key pair. `dot4_avx2` now scores four keys against
+the same query with four accumulators and collapses them in three `hadd`s plus
+one 128-bit fold — because `hadd` interleaves two sources, `hadd(hadd(a,b),
+hadd(c,d))` leaves all four partial sums in known lanes. Roughly a quarter of the
+reduction work per key.
+
+What remains is the scalar softmax bookkeeping between blocks and the `axpy`
+accumulate, which re-reads the output row once per key rather than holding it in
+registers across the block. Both are visible in the same way the reduction was:
+as work that scales with query-key pairs but never touches an FMA port.
 
 **Causal block-skipping pays, and the GFLOP/s tables cannot show it.** Those
 tables divide by a causal-aware FLOP count, which normalizes the halved work
@@ -148,6 +164,53 @@ matrix does not just cost memory traffic; it forces you to touch entries you
 have already decided to throw away. The tiled kernels skip those blocks and
 never pay for them, which is the clearest single argument in the project for the
 flash formulation.
+
+## Multi-head: the outer loop that makes this a layer
+
+Real attention runs `h` heads over the same sequence. They never interact until
+the concatenation, so it is `h` independent instances of the single-head problem
+— which forces a scheduling choice: parallelize *across* heads, or *within* one?
+
+Across heads, and the roofline is the argument. Each head is already
+compute-bound at `d = 64`, so cores are not waiting on memory and there is
+nothing to win by splitting one head's working set between them. Splitting
+within a head would mean sharing the running softmax state `m` and `l` across
+threads — either synchronizing every KV block, or keeping per-thread partial
+accumulators and merging them, which is the same rescaling dance the online
+softmax already does, now with a barrier in it. Across heads needs none of that:
+separate inputs, separate outputs, no shared mutable state. `std::thread::scope`
+lets the workers borrow the inputs directly, so it costs no dependency and no
+copying.
+
+Scaling, `n = 512`, on an M1 Pro with 8 logical cores (a different machine from
+the tables above — this measures thread scaling, not kernel throughput):
+
+| heads | serial | parallel | speedup | of ideal |
+|------:|-------:|---------:|--------:|---------:|
+| 1     | 9.08ms | 9.16ms   | 0.99×   | 99%      |
+| 2     | 18.40  | 9.29     | 1.98×   | 99%      |
+| 4     | 36.33  | 9.48     | 3.83×   | 96%      |
+| 8     | 72.82  | 16.43    | 4.43×   | 55%      |
+
+Near-linear to 4 heads, then it falls off a cliff — because those 8 "logical
+cores" are not interchangeable. This part has 6 performance cores and 2
+efficiency cores, so the 7th and 8th heads land on cores that are several times
+slower, and the join waits for them. That is the granularity cost of
+across-heads parallelism, and it is the regime where within-head splitting would
+start to earn its complexity.
+
+## Tile size
+
+`BLOCK` decides the inner loop's working set: `2 × BLOCK × d × 4` bytes of K and
+V resident at once. `cargo run --release --bin blocksweep` measures the curve
+across five const-generic instantiations rather than assuming it — the sizes are
+compile-time constants in each, so it measures cache behaviour and not the cost
+of a dynamic bound.
+
+Worth running before trusting the default. On the M1 the curve is still climbing
+at `BLOCK = 256` (128 KB, which fits that part's unusually large 128 KB L1d),
+so the default 64 is leaving a few percent on the table there. `BLOCK = 64` is
+sized for a conventional 32–48 KB L1d.
 
 ## AVX-512 (nightly)
 
@@ -182,12 +245,12 @@ explicitly projected, not observed.
 
 ## Next steps
 
-- Multi-head batching (the outer loop that makes this a real layer).
-- Wire the AVX-512 kernel into the runtime dispatch, and measure it on a part
-  that actually has AVX-512.
-- Sweep `BLOCK` per cache level.
-- Attack the 17%-of-peak gap: the per-dot-product horizontal reduction is the
-  obvious first target.
+- Measure the AVX-512 kernel on a part that actually has AVX-512.
+- Keep closing the gap to peak: with the dot-product reduction amortized four
+  ways, the next candidates are the scalar softmax bookkeeping between blocks
+  and the `axpy` accumulate, which re-reads the output row per key.
+- Within-head parallelism, for the case where heads are fewer than cores.
+- A packed `[n, h*d]` layout, so multi-head does not need one `Mat` per head.
 
 ## Layout
 
@@ -198,13 +261,22 @@ src/tiled.rs     online-softmax flash kernel with causal block-skipping
 src/simd.rs      AVX2+FMA intrinsics + vectorized exp + runtime dispatch
 src/vexp.rs      8-wide exp approximation
 src/avx512.rs    16-wide kernel, cfg-gated for nightly / Rust 1.89+
-src/roofline.rs  traffic model, measured machine ceilings, SVG writer
-src/bin/bench.rs standalone benchmark (both masks)
-src/bin/roofline.rs  regenerates docs/roofline.{svg,json}
+src/multihead.rs multi-head batching, serial and across-heads parallel
+src/roofline.rs  traffic model, measured machine ceilings, SVG writer, JSON reader
+src/bin/bench.rs both masks, measured causal speedup, multi-head scaling
+src/bin/roofline.rs  regenerates docs/roofline.{svg,json}; --from-json re-renders
+src/bin/blocksweep.rs  tile size vs throughput across cache levels
 benches/         criterion harness
-tests/           correctness vs naive, both masks
-docs/            generated roofline figure + the data behind it
+tests/           correctness vs naive: both masks, all tile sizes, multi-head
+docs/            roofline figure + its data, and the online-softmax derivation
 ```
+
+## Reading further
+
+[`docs/online-softmax.md`](docs/online-softmax.md) derives the running-softmax
+update from scratch — why one multiply repairs the entire accumulated history
+when the max moves, why the result is exact rather than approximate, and why the
+causal block-skip falls out of the same structure.
 
 ## License
 

@@ -61,6 +61,16 @@ pub struct Machine {
     /// thermal throttling — and the ceiling is not worth plotting against.
     pub peak_spread_pct: f64,
     pub bandwidth_spread_pct: f64,
+    /// The compute ceiling re-measured *after* all the kernel timings, to catch
+    /// the machine changing underneath the run.
+    ///
+    /// This exists because `bench` and `roofline` disagreed by ~25% on the same
+    /// kernels, and the obvious suspect was that `roofline` runs several seconds
+    /// of saturated FMA and 192 MB of streaming before it times anything, which
+    /// could leave the core in a different clock or thermal state. If the two
+    /// ceiling measurements bracket the kernels and agree, that hypothesis is
+    /// dead and the disagreement is elsewhere. Zero if not measured.
+    pub peak_recheck_gflops: f64,
 }
 
 /// Spread thresholds past which `roofline` warns that the host was too noisy.
@@ -73,6 +83,10 @@ pub struct Machine {
 /// ordinary even on a quiet machine and only a much larger spread is alarming.
 pub const COMPUTE_NOISE_WARN_PCT: f64 = 10.0;
 pub const BANDWIDTH_NOISE_WARN_PCT: f64 = 25.0;
+
+/// Drift between the before- and after-kernel compute ceilings past which the
+/// run is not a single consistent experiment.
+pub const DRIFT_WARN_PCT: f64 = 5.0;
 
 /// Best and worst of a set of samples, reduced to (best, spread %).
 fn summarize(samples: &[f64]) -> (f64, f64) {
@@ -87,6 +101,15 @@ fn summarize(samples: &[f64]) -> (f64, f64) {
 }
 
 impl Machine {
+    /// How far the compute ceiling moved between the start and end of the run,
+    /// as a percentage. Zero when no recheck was taken.
+    pub fn drift_pct(&self) -> f64 {
+        if self.peak_recheck_gflops <= 0.0 || self.peak_gflops <= 0.0 {
+            return 0.0;
+        }
+        (self.peak_gflops - self.peak_recheck_gflops).abs() / self.peak_gflops * 100.0
+    }
+
     /// Arithmetic intensity at which the two ceilings cross. Left of it the
     /// workload is memory-bound, right of it compute-bound.
     pub fn ridge(&self) -> f64 {
@@ -324,6 +347,7 @@ pub fn measure_machine() -> Machine {
         bandwidth_gbs,
         peak_spread_pct,
         bandwidth_spread_pct,
+        peak_recheck_gflops: 0.0,
     }
 }
 
@@ -381,14 +405,16 @@ pub fn to_json(m: &Machine, pts: &[Point]) -> String {
     let mut s = String::new();
     s.push_str("{\n");
     s.push_str(&format!(
-        "  \"machine\": {{ \"arch\": \"{}\", \"isa\": \"{}\", \"peak_gflops\": {:.3}, \"bandwidth_gbs\": {:.3}, \"ridge_flop_per_byte\": {:.4}, \"peak_spread_pct\": {:.2}, \"bandwidth_spread_pct\": {:.2} }},\n",
+        "  \"machine\": {{ \"arch\": \"{}\", \"isa\": \"{}\", \"peak_gflops\": {:.3}, \"bandwidth_gbs\": {:.3}, \"ridge_flop_per_byte\": {:.4}, \"peak_spread_pct\": {:.2}, \"bandwidth_spread_pct\": {:.2}, \"peak_recheck_gflops\": {:.3}, \"drift_pct\": {:.2} }},\n",
         m.arch,
         m.isa,
         m.peak_gflops,
         m.bandwidth_gbs,
         m.ridge(),
         m.peak_spread_pct,
-        m.bandwidth_spread_pct
+        m.bandwidth_spread_pct,
+        m.peak_recheck_gflops,
+        m.drift_pct()
     ));
     s.push_str(&format!("  \"head_dim\": {},\n", HEAD_DIM));
     s.push_str("  \"points\": [\n");
@@ -661,4 +687,95 @@ pub fn to_svg(m: &Machine, pts: &[Point]) -> String {
 
     s.push_str("</svg>\n");
     s
+}
+
+// ---------------------------------------------------------------------------
+// Reading back
+// ---------------------------------------------------------------------------
+
+/// Scan for `"key": <number>` starting at `from`, returning the value and the
+/// offset just past it.
+fn scan_num(s: &str, key: &str, from: usize) -> Option<(f64, usize)> {
+    let pat = format!("\"{key}\":");
+    let at = s[from..].find(&pat)? + from + pat.len();
+    let rest = &s[at..];
+    let lead = rest.find(|c: char| !c.is_whitespace())?;
+    let tail = &rest[lead..];
+    let end = tail
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(tail.len());
+    Some((tail[..end].parse().ok()?, at + lead + end))
+}
+
+/// Scan for `"key": "<string>"` starting at `from`.
+fn scan_str(s: &str, key: &str, from: usize) -> Option<(String, usize)> {
+    let pat = format!("\"{key}\":");
+    let at = s[from..].find(&pat)? + from + pat.len();
+    let open = s[at..].find('"')? + at + 1;
+    let close = s[open..].find('"')? + open;
+    Some((s[open..close].to_string(), close + 1))
+}
+
+/// Re-read a document written by [`to_json`].
+///
+/// Deliberately not a general JSON parser — it scans for the keys this module
+/// emits and nothing else. That is enough to re-render a committed figure
+/// without measuring anything, which matters for a repo whose argument is
+/// measurement discipline: a reader with no access to the original hardware can
+/// still regenerate the plot from the data, and a local run can no longer
+/// silently overwrite a figure that came from somewhere else.
+///
+/// Returns `None` if a required key is missing.
+pub fn from_json(text: &str) -> Option<(Machine, Vec<Point>)> {
+    let (isa, _) = scan_str(text, "isa", 0)?;
+    let (peak_gflops, _) = scan_num(text, "peak_gflops", 0)?;
+    let (bandwidth_gbs, _) = scan_num(text, "bandwidth_gbs", 0)?;
+    let (peak_spread_pct, _) = scan_num(text, "peak_spread_pct", 0)?;
+    let (bandwidth_spread_pct, _) = scan_num(text, "bandwidth_spread_pct", 0)?;
+    let peak_recheck_gflops = scan_num(text, "peak_recheck_gflops", 0)
+        .map(|(v, _)| v)
+        .unwrap_or(0.0);
+
+    // `arch` is &'static, so map the recorded string onto a known literal.
+    let (arch_read, _) = scan_str(text, "arch", 0)?;
+    let arch: &'static str = match arch_read.as_str() {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => "unknown",
+    };
+
+    let machine = Machine {
+        arch,
+        isa,
+        peak_gflops,
+        bandwidth_gbs,
+        peak_spread_pct,
+        bandwidth_spread_pct,
+        peak_recheck_gflops,
+    };
+
+    let mut pts = Vec::new();
+    let mut at = text.find("\"points\"")?;
+    while let Some((kernel_read, next)) = scan_str(text, "kernel", at) {
+        let kernel = KERNELS.iter().find(|k| **k == kernel_read)?;
+        let (n, _) = scan_num(text, "n", next)?;
+        let (mask, _) = scan_str(text, "mask", next)?;
+        let (gflops, _) = scan_num(text, "gflops", next)?;
+        let (intensity, _) = scan_num(text, "intensity_flop_per_byte", next)?;
+        let (best_secs, _) = scan_num(text, "best_secs", next)?;
+        let (median_secs, _) = scan_num(text, "median_secs", next)?;
+        let (spread_pct, end) = scan_num(text, "spread_pct", next)?;
+        pts.push(Point {
+            kernel,
+            n: n as usize,
+            causal: mask == "causal",
+            gflops,
+            intensity,
+            best_secs,
+            median_secs,
+            spread_pct,
+        });
+        at = end;
+    }
+    Some((machine, pts))
 }

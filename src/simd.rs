@@ -65,14 +65,34 @@ unsafe fn attention_avx2(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
                 }
 
                 // Score against the (possibly truncated) KV block.
+                // Four keys per horizontal reduction. The reduction at the tail
+                // of a dot product does not vectorize and was the largest single
+                // item in the gap to peak; scoring four keys against the same
+                // query lets one reduction serve all four.
                 let mut block_scores = [0.0f32; BLOCK];
                 let mut block_max = f32::NEG_INFINITY;
-                for (bj, j) in (kv0..jhi).enumerate() {
-                    let acc = dot_avx2(qi, k.row(j)) * scale;
-                    block_scores[bj] = acc;
-                    if acc > block_max {
-                        block_max = acc;
+                let mut bj = 0usize;
+                let mut j = kv0;
+                while j + 4 <= jhi {
+                    let four = dot4_avx2(qi, k.row(j), k.row(j + 1), k.row(j + 2), k.row(j + 3));
+                    for (o, &raw) in four.iter().enumerate() {
+                        let s = raw * scale;
+                        block_scores[bj + o] = s;
+                        if s > block_max {
+                            block_max = s;
+                        }
                     }
+                    bj += 4;
+                    j += 4;
+                }
+                while j < jhi {
+                    let s = dot_avx2(qi, k.row(j)) * scale;
+                    block_scores[bj] = s;
+                    if s > block_max {
+                        block_max = s;
+                    }
+                    bj += 1;
+                    j += 1;
                 }
 
                 let m_old = m[i];
@@ -151,6 +171,58 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
         t += 1;
     }
     total
+}
+
+/// Four dot products against a shared `a`, sharing one horizontal reduction.
+///
+/// A single 8-wide dot ends with `extractf128 + add + hadd + hadd`, which is
+/// serial, does not use the FMA units, and costs the same whether the vector
+/// body was 8 elements or 64. At `d = 64` that tail runs once per query-key
+/// pair and is a large part of why the kernel sits well under peak.
+///
+/// Four accumulators collapse in three `hadd`s plus one 128-bit fold, because
+/// `hadd` interleaves two sources: `hadd(hadd(a,b), hadd(c,d))` leaves the four
+/// partial sums in known lanes, and folding the halves finishes all four at
+/// once. Roughly a quarter of the reduction work per key.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot4_avx2(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let mut t = 0;
+    while t + 8 <= n {
+        let va = _mm256_loadu_ps(a.as_ptr().add(t));
+        acc0 = _mm256_fmadd_ps(va, _mm256_loadu_ps(b0.as_ptr().add(t)), acc0);
+        acc1 = _mm256_fmadd_ps(va, _mm256_loadu_ps(b1.as_ptr().add(t)), acc1);
+        acc2 = _mm256_fmadd_ps(va, _mm256_loadu_ps(b2.as_ptr().add(t)), acc2);
+        acc3 = _mm256_fmadd_ps(va, _mm256_loadu_ps(b3.as_ptr().add(t)), acc3);
+        t += 8;
+    }
+
+    // hadd(a,b) yields [a01 a23 b01 b23 | a45 a67 b45 b67], so nesting it once
+    // more puts the four full sums in lanes 0..3 of each 128-bit half.
+    let ab = _mm256_hadd_ps(acc0, acc1);
+    let cd = _mm256_hadd_ps(acc2, acc3);
+    let abcd = _mm256_hadd_ps(ab, cd);
+    let folded = _mm_add_ps(_mm256_castps256_ps128(abcd), _mm256_extractf128_ps(abcd, 1));
+
+    let mut out = [0.0f32; 4];
+    _mm_storeu_ps(out.as_mut_ptr(), folded);
+
+    while t < n {
+        let x = a[t];
+        out[0] += x * b0[t];
+        out[1] += x * b1[t];
+        out[2] += x * b2[t];
+        out[3] += x * b3[t];
+        t += 1;
+    }
+    out
 }
 
 #[cfg(target_arch = "x86_64")]

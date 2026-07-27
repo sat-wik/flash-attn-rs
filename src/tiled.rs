@@ -10,9 +10,25 @@
 
 use crate::Mat;
 
+/// Default tile height and width, in rows.
+///
+/// The tile is the working set: `BLOCK` rows of K and V plus the query row, so
+/// the choice is really "which cache level should the inner loop live in".
+/// 64 rows at `d = 64` is 2 x 64 x 64 x 4 B = 32 KB of K and V, which is sized
+/// to sit inside a typical 32-48 KB L1d. `src/bin/blocksweep.rs` measures the
+/// curve rather than assuming it.
 pub const BLOCK: usize = 64;
 
+/// The kernel at the default tile size.
 pub fn attention(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
+    attention_b::<BLOCK>(q, k, v, causal)
+}
+
+/// The kernel with the tile size as a const parameter, so a sweep can
+/// instantiate several and compare. Monomorphized per size, so the block bounds
+/// stay compile-time constants exactly as they are in `attention`, and the sweep
+/// measures the cache behaviour rather than the cost of a dynamic bound.
+pub fn attention_b<const BLOCK: usize>(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
     let n = q.rows;
     let d = q.cols;
     let scale = 1.0 / (d as f32).sqrt();

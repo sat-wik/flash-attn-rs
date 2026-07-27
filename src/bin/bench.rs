@@ -7,7 +7,8 @@
 //! use the `roofline` binary, which also measures the machine's ceilings.
 
 use flash_attn_rs::{
-    attention_flops, filled, max_abs_diff, naive, roofline, simd, tiled, time_interleaved,
+    attention_flops, filled, max_abs_diff, multihead, naive, roofline, simd, tiled,
+    time_interleaved,
 };
 
 fn iters_for(n: usize) -> usize {
@@ -109,6 +110,48 @@ fn causal_speedup() {
     println!("\nIdeal is 2.00x — the causal mask leaves n(n+1)/2 of n^2 query-key pairs.");
 }
 
+/// Multi-head scaling: the outer loop that makes this a layer.
+///
+/// Heads are independent, so this is the cheapest parallelism in the whole
+/// problem — no shared state, no synchronization beyond the join. What it
+/// cannot do is beat the core count, and with fewer heads than cores some
+/// cores simply idle, which is where the numbers stop scaling.
+fn multihead() {
+    let (d, n) = (64usize, 512usize);
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1);
+    println!("\n=== multi-head, n = {n}, d = {d}, {cores} logical cores ===");
+    println!(
+        "{:>6}  {:>13}  {:>15}  {:>10}  {:>12}",
+        "heads", "serial (ms)", "parallel (ms)", "speedup", "vs ideal"
+    );
+
+    for &h in &[1usize, 2, 4, 8] {
+        let q = multihead::filled_heads(h, n, d, 11);
+        let k = multihead::filled_heads(h, n, d, 22);
+        let v = multihead::filled_heads(h, n, d, 33);
+
+        // Same reason as everywhere else: these two are being divided.
+        let mut f_serial = || drop(multihead::attention(&q, &k, &v, false));
+        let mut f_par = || drop(multihead::attention_parallel(&q, &k, &v, false, cores));
+        let t = time_interleaved(&mut [&mut f_serial, &mut f_par], 10);
+        let (serial, par) = (t[0], t[1]);
+
+        let speedup = serial.best / par.best;
+        let ideal = (h.min(cores)) as f64;
+        println!(
+            "{:>6}  {:>13.2}  {:>15.2}  {:>9.2}x  {:>11.0}%",
+            h,
+            serial.best * 1e3,
+            par.best * 1e3,
+            speedup,
+            speedup / ideal * 100.0
+        );
+    }
+    println!("\n\"vs ideal\" is the fraction of min(heads, cores)x actually achieved.");
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--json") {
         let machine = roofline::measure_machine();
@@ -119,4 +162,5 @@ fn main() {
     run(false);
     run(true);
     causal_speedup();
+    multihead();
 }

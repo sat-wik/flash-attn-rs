@@ -1,5 +1,5 @@
 {
-  "machine": { "arch": "x86_64", "isa": "AVX2 + FMA", "peak_gflops": 78.898, "bandwidth_gbs": 16.292, "ridge_flop_per_byte": 4.8427, "peak_spread_pct": 2.33, "bandwidth_spread_pct": 11.13 },
+  "machine": { "arch": "x86_64", "isa": "AVX2 + FMA", "peak_gflops": 78.898, "bandwidth_gbs": 16.292, "ridge_flop_per_byte": 4.8427, "peak_spread_pct": 2.33, "bandwidth_spread_pct": 11.13, "peak_recheck_gflops": 0.000, "drift_pct": 0.00 },
   "head_dim": 64,
   "points": [
     { "kernel": "naive", "n": 128, "mask": "full", "gflops": 3.4715, "intensity_flop_per_byte": 10.6667, "best_secs": 0.001208226, "median_secs": 0.001647152, "spread_pct": 20.74 },

@@ -10,6 +10,7 @@
 //! Q, K, V are row-major [n x d] matrices. `n` = sequence length, `d` = head dim.
 
 pub mod avx512;
+pub mod multihead;
 pub mod naive;
 pub mod roofline;
 pub mod simd;

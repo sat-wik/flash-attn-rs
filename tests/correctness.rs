@@ -56,3 +56,56 @@ fn avx512_matches_naive() {
         }
     }
 }
+
+#[test]
+fn multihead_matches_per_head() {
+    use flash_attn_rs::multihead;
+    for &causal in &[false, true] {
+        for &(heads, n, d) in &[(1usize, 33usize, 16usize), (4, 130, 64), (7, 64, 32)] {
+            let q = multihead::filled_heads(heads, n, d, 11);
+            let k = multihead::filled_heads(heads, n, d, 22);
+            let v = multihead::filled_heads(heads, n, d, 33);
+
+            let serial = multihead::attention(&q, &k, &v, causal);
+            assert_eq!(serial.len(), heads);
+
+            // Each head must equal the single-head kernel on that head's data.
+            for h in 0..heads {
+                let one = simd::attention(&q[h], &k[h], &v[h], causal);
+                assert_eq!(max_abs_diff(&serial[h], &one), 0.0);
+            }
+
+            // And splitting across threads must not change a single value,
+            // whatever the chunking works out to.
+            for threads in [2usize, 3, 8] {
+                let par = multihead::attention_parallel(&q, &k, &v, causal, threads);
+                assert_eq!(par.len(), heads);
+                for h in 0..heads {
+                    let diff = max_abs_diff(&serial[h], &par[h]);
+                    assert_eq!(diff, 0.0, "threads={threads} head={h} diff={diff}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn block_sizes_agree() {
+    use flash_attn_rs::tiled;
+    for &causal in &[false, true] {
+        for &(n, d) in &[(65usize, 32usize), (200, 64)] {
+            let q = filled(n, d, 4);
+            let k = filled(n, d, 5);
+            let v = filled(n, d, 6);
+            let reference = naive::attention(&q, &k, &v, causal);
+            macro_rules! check {
+                ($($b:literal),*) => {$({
+                    let got = tiled::attention_b::<$b>(&q, &k, &v, causal);
+                    let diff = max_abs_diff(&reference, &got);
+                    assert!(diff < 1e-4, "BLOCK={} n={n} causal={causal} diff={diff}", $b);
+                })*};
+            }
+            check!(16, 32, 64, 128, 256);
+        }
+    }
+}
