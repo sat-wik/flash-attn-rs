@@ -37,9 +37,12 @@ pub struct Point {
     pub gflops: f64,
     /// FLOPs per byte moved, from the traffic model in `bytes_moved`.
     pub intensity: f64,
-    /// Median seconds per run. Emitted so the causal-vs-full wall-clock ratio is
-    /// a division of two committed measurements rather than something inferred
-    /// from GFLOP/s and a FLOP count.
+    /// Fastest seconds observed — the basis for `gflops`, and what makes the
+    /// causal-vs-full wall-clock ratio a division of two committed measurements
+    /// rather than something inferred from GFLOP/s and a FLOP count.
+    pub best_secs: f64,
+    /// Median seconds, kept alongside `best_secs` so a reader can see how far
+    /// apart the two are without rerunning anything.
     pub median_secs: f64,
     /// Interquartile spread of the timing, as a percentage of the median.
     pub spread_pct: f64,
@@ -347,8 +350,9 @@ pub fn measure_points() -> Vec<Point> {
                     kernel,
                     n,
                     causal,
-                    gflops: flops / t.median / 1e9,
+                    gflops: flops / t.best / 1e9,
                     intensity: flops / bytes_moved(kernel, n, d, causal),
+                    best_secs: t.best,
                     median_secs: t.median,
                     spread_pct: t.spread_pct,
                 });
@@ -379,12 +383,13 @@ pub fn to_json(m: &Machine, pts: &[Point]) -> String {
     s.push_str("  \"points\": [\n");
     for (i, p) in pts.iter().enumerate() {
         s.push_str(&format!(
-            "    {{ \"kernel\": \"{}\", \"n\": {}, \"mask\": \"{}\", \"gflops\": {:.4}, \"intensity_flop_per_byte\": {:.4}, \"median_secs\": {:.9}, \"spread_pct\": {:.2} }}{}\n",
+            "    {{ \"kernel\": \"{}\", \"n\": {}, \"mask\": \"{}\", \"gflops\": {:.4}, \"intensity_flop_per_byte\": {:.4}, \"best_secs\": {:.9}, \"median_secs\": {:.9}, \"spread_pct\": {:.2} }}{}\n",
             p.kernel,
             p.n,
             if p.causal { "causal" } else { "full" },
             p.gflops,
             p.intensity,
+            p.best_secs,
             p.median_secs,
             p.spread_pct,
             if i + 1 == pts.len() { "" } else { "," }

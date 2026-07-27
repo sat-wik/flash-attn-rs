@@ -72,9 +72,22 @@ pub fn max_abs_diff(a: &Mat, b: &Mat) -> f32 {
 }
 
 /// Wall-clock result for one timed kernel.
+///
+/// Report throughput from `best`, not `median`. Interference on a shared
+/// machine is one-sided — a descheduled slice, a neighbour evicting your cache,
+/// a stolen timeslice can only ever make a run *slower*, never faster — so the
+/// fastest observed run is the least-contaminated estimate of how long the
+/// kernel actually takes. The median is an estimate of what the machine was
+/// doing to you, which is a different question.
+///
+/// It also keeps this consistent with the roofline ceilings, which take the
+/// best of several probes. Comparing best-case ceilings against median-case
+/// operating points would understate every "percentage of peak" on the chart.
 #[derive(Clone, Copy)]
 pub struct Timing {
-    /// Median seconds per run.
+    /// Fastest seconds observed. Use this for throughput.
+    pub best: f64,
+    /// Median seconds per run, kept for reference against `best`.
     pub median: f64,
     /// Interquartile range as a percentage of the median.
     ///
@@ -103,6 +116,7 @@ pub fn time_stats<F: FnMut()>(mut f: F, iters: usize) -> Timing {
     let q1 = s[s.len() / 4];
     let q3 = s[(3 * s.len()) / 4];
     Timing {
+        best: s[0],
         median,
         spread_pct: if median > 0.0 {
             (q3 - q1) / median * 100.0

@@ -47,10 +47,10 @@ fn run(causal: bool) {
         println!(
             "{:>6}  {:>14.2}  {:>14.2}  {:>14.2}  {:>12.2}x  {:>11.1}%",
             n,
-            g(tn.median),
-            g(tt.median),
-            g(ts.median),
-            tn.median / ts.median,
+            g(tn.best),
+            g(tt.best),
+            g(ts.best),
+            tn.best / ts.best,
             ts.spread_pct
         );
     }
@@ -88,9 +88,9 @@ fn causal_speedup() {
                 "{:>6}  {:>8}  {:>13.3}  {:>15.3}  {:>9.2}x",
                 n,
                 kernel,
-                full.median * 1e3,
-                causal.median * 1e3,
-                full.median / causal.median
+                full.best * 1e3,
+                causal.best * 1e3,
+                full.best / causal.best
             );
         }
     }
