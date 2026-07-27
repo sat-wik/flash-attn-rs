@@ -1,0 +1,30 @@
+{
+  "machine": { "arch": "x86_64", "isa": "AVX2 + FMA", "peak_gflops": 77.916, "bandwidth_gbs": 14.844, "ridge_flop_per_byte": 5.2489, "peak_spread_pct": 4.43, "bandwidth_spread_pct": 7.10 },
+  "head_dim": 64,
+  "points": [
+    { "kernel": "naive", "n": 128, "mask": "full", "gflops": 2.2587, "intensity_flop_per_byte": 10.6667 },
+    { "kernel": "tiled", "n": 128, "mask": "full", "gflops": 2.6745, "intensity_flop_per_byte": 21.3333 },
+    { "kernel": "simd", "n": 128, "mask": "full", "gflops": 10.7578, "intensity_flop_per_byte": 21.3333 },
+    { "kernel": "naive", "n": 256, "mask": "full", "gflops": 2.1474, "intensity_flop_per_byte": 12.8000 },
+    { "kernel": "tiled", "n": 256, "mask": "full", "gflops": 3.1836, "intensity_flop_per_byte": 25.6000 },
+    { "kernel": "simd", "n": 256, "mask": "full", "gflops": 12.0435, "intensity_flop_per_byte": 25.6000 },
+    { "kernel": "naive", "n": 512, "mask": "full", "gflops": 2.3368, "intensity_flop_per_byte": 14.2222 },
+    { "kernel": "tiled", "n": 512, "mask": "full", "gflops": 3.0786, "intensity_flop_per_byte": 28.4444 },
+    { "kernel": "simd", "n": 512, "mask": "full", "gflops": 13.6220, "intensity_flop_per_byte": 28.4444 },
+    { "kernel": "naive", "n": 1024, "mask": "full", "gflops": 2.1041, "intensity_flop_per_byte": 15.0588 },
+    { "kernel": "tiled", "n": 1024, "mask": "full", "gflops": 2.8520, "intensity_flop_per_byte": 30.1176 },
+    { "kernel": "simd", "n": 1024, "mask": "full", "gflops": 10.7179, "intensity_flop_per_byte": 30.1176 },
+    { "kernel": "naive", "n": 128, "mask": "causal", "gflops": 2.0092, "intensity_flop_per_byte": 8.0311 },
+    { "kernel": "tiled", "n": 128, "mask": "causal", "gflops": 2.6957, "intensity_flop_per_byte": 12.9000 },
+    { "kernel": "simd", "n": 128, "mask": "causal", "gflops": 11.1031, "intensity_flop_per_byte": 12.9000 },
+    { "kernel": "naive", "n": 256, "mask": "causal", "gflops": 1.9036, "intensity_flop_per_byte": 10.6805 },
+    { "kernel": "tiled", "n": 256, "mask": "causal", "gflops": 2.6154, "intensity_flop_per_byte": 18.3571 },
+    { "kernel": "simd", "n": 256, "mask": "causal", "gflops": 11.8081, "intensity_flop_per_byte": 18.3571 },
+    { "kernel": "naive", "n": 512, "mask": "causal", "gflops": 1.6922, "intensity_flop_per_byte": 12.8050 },
+    { "kernel": "tiled", "n": 512, "mask": "causal", "gflops": 2.5978, "intensity_flop_per_byte": 23.3182 },
+    { "kernel": "simd", "n": 512, "mask": "causal", "gflops": 10.4717, "intensity_flop_per_byte": 23.3182 },
+    { "kernel": "naive", "n": 1024, "mask": "causal", "gflops": 1.7869, "intensity_flop_per_byte": 14.2238 },
+    { "kernel": "tiled", "n": 1024, "mask": "causal", "gflops": 2.7082, "intensity_flop_per_byte": 26.9737 },
+    { "kernel": "simd", "n": 1024, "mask": "causal", "gflops": 11.4454, "intensity_flop_per_byte": 26.9737 }
+  ]
+}

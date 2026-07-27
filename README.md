@@ -25,61 +25,91 @@ All kernels are verified bit-close to the naive reference, for both masks
 
 ## Results
 
-`head_dim = 64`, single core, `target-cpu=native` (AVX2 + FMA), stable Rust.
-GFLOP/s (causal counts only the ~n²/2 unmasked pairs, so it's comparable):
+**AVX2 with a vectorized softmax runs 4.8–6.4× faster than the naive baseline.**
+Tiling on its own is worth another 1.2–1.5×, and causal block-skipping roughly
+halves wall-clock time. But the fastest kernel still reaches only ~17% of the
+machine's measured compute ceiling, and the roofline below shows why: at
+`d = 64` this workload is compute-bound at every size tested, so the
+memory-traffic win that tiling exists for never gets to pay.
+
+Single core of an x86_64 machine with AVX2 + FMA (a shared VPS vCPU — hence
+modest absolute throughput; the *ratios* are the point), `head_dim = 64`, stable
+Rust with `-C target-cpu=native`. GFLOP/s counts only unmasked query–key pairs,
+so the two masks are directly comparable. Every number here and in the figure
+comes from one run of the committed generator.
 
 **Full (bidirectional) mask**
 
 | n    | naive | tiled | simd  | simd speedup |
 |-----:|------:|------:|------:|-------------:|
-| 128  | 3.59  | 3.46  | 18.08 | **5.03×**    |
-| 256  | 3.59  | 3.40  | 17.58 | **4.90×**    |
-| 512  | 3.19  | 3.48  | 17.69 | **5.55×**    |
-| 1024 | 3.54  | 3.70  | 18.61 | **5.25×**    |
+| 128  | 2.26  | 2.67  | 10.76 | **4.76×**    |
+| 256  | 2.15  | 3.18  | 12.04 | **5.61×**    |
+| 512  | 2.34  | 3.08  | 13.62 | **5.83×**    |
+| 1024 | 2.10  | 2.85  | 10.72 | **5.09×**    |
 
 **Causal mask**
 
 | n    | naive | tiled | simd  | simd speedup |
 |-----:|------:|------:|------:|-------------:|
-| 128  | 3.58  | 3.74  | 16.13 | **4.50×**    |
-| 256  | 3.49  | 3.47  | 17.60 | **5.04×**    |
-| 512  | 3.39  | 3.54  | 18.46 | **5.45×**    |
-| 1024 | 3.39  | 3.40  | 18.47 | **5.44×**    |
+| 128  | 2.01  | 2.70  | 11.10 | **5.53×**    |
+| 256  | 1.90  | 2.62  | 11.81 | **6.20×**    |
+| 512  | 1.69  | 2.60  | 10.47 | **6.19×**    |
+| 1024 | 1.79  | 2.71  | 11.45 | **6.41×**    |
 
-**Causal block-skipping, raw wall-clock (SIMD kernel):**
-`n=512: 1.91× faster`, `n=1024: 1.96× faster` than the full mask — roughly the
-2× you'd predict from doing half the query-key pairs.
+![Roofline: attention kernels against measured compute and bandwidth ceilings](docs/roofline.svg)
 
 ```
+cargo run --release --bin roofline   # regenerates the figure above + its JSON
 cargo run --release --bin bench      # zero-dep, stable Rust, both masks
 cargo bench                          # criterion, with plots
 cargo test --release                 # correctness vs naive, both masks
 ```
-Reproduce with `RUSTFLAGS="-C target-cpu=native"`.
+Reproduce with `RUSTFLAGS="-C target-cpu=native"`. The roofline binary measures
+both ceilings on whatever machine runs it, stamps the figure with that machine,
+and refuses to be quiet about it if the host was too contended to trust.
 
 ## What the numbers say
 
-**Vectorized exp bought the last ~0.7×.** The baseline SIMD kernel (scalar
-`exp`) topped out around 4.5×; moving the softmax exponentials into an 8-wide
-polynomial approximation (`src/vexp.rs`) lifted the full-mask speedup to
-~5.0–5.5×. The remaining gap to the 8× lane-count ceiling is the horizontal
-reduction at the tail of each dot product plus loop/bookkeeping overhead — a
-roofline story, not a bug.
+**Everything here is compute-bound, and that is the whole story.** The ridge
+point on this machine — where the bandwidth ceiling crosses the compute ceiling
+— sits at 5.25 FLOP/byte. Every kernel at every size lands to the *right* of it,
+between 8 and 30 FLOP/byte. Nothing in this workload is waiting on memory, so
+moving fewer bytes cannot be the lever that makes it faster. That single fact
+predicts the rest of the table.
 
-**Causal masking is the real algorithmic win: ~1.9× wall-clock.** The tiled
-kernels skip any KV block that lies entirely above the diagonal, so they touch
-only the lower-triangular half of the score space. This is also where tiling
-finally beats naive on raw GFLOP/s at several sizes (e.g. n=128: 3.74 vs 3.58) —
-the block-skip gives the flash formulation a structural advantage the naive
-triple-loop can't get, because naive still walks masked columns.
+**Which is why tiling wins so little.** Flash Attention exists to avoid
+materializing the `[n×n]` score matrix, cutting traffic from O(n²) to O(n·d).
+The figure shows it doing exactly that — the tiled points sit at roughly twice
+the arithmetic intensity of the naive ones, shifted a full step right. And it
+buys 1.2–1.5×. On hardware where this problem were memory-bound, that horizontal
+shift would translate straight into throughput; here it moves the point sideways
+along a flat ceiling and the modest win that remains comes from doing fewer
+passes over the scores, not from bandwidth. **This is the honest negative
+result, and it is the interesting part of the project**: the optimization is
+correctly implemented and simply mis-targeted at this size and `d`. Flash's real
+win needs larger `n`, smaller cache, or the HBM-bound GPU regime it was designed
+for.
 
-**When tiling *doesn't* help (the honest part).** On the full mask at these
-sizes and `d=64`, the naive `[n×n]` scores still fit in L2, so we're
-compute-bound, not memory-bound — below the roofline ridge point, tiling's
-online-softmax rescaling is pure overhead and buys nothing. Flash's memory-traffic
-win shows up at larger `n`, smaller cache, or on bandwidth-bound hardware (the
-HBM/GPU regime it was designed for and the silicon this targets). Knowing *when*
-an optimization pays is the actual skill.
+**Vectorization is the lever that actually applies.** Being compute-bound means
+the way up is issuing better instructions, and that is what AVX2 does — 4.8–6.4×,
+moving the points vertically rather than horizontally. Most of it is the
+8-wide dot product and accumulate; the last stretch came from replacing the
+per-score scalar `exp` with an 8-wide polynomial (`src/vexp.rs`), which had been
+the binding constraint on the softmax.
+
+**And there is still 5× left on the table.** The best kernel reaches 13.6 of
+78 GFLOP/s — about 17% of measured peak. The gap is the horizontal reduction at
+the tail of every dot product, the scalar softmax bookkeeping between blocks,
+and per-block loop overhead, none of which vectorize. That is a roofline
+argument for where to look next, not a mystery.
+
+**Causal masking is worth roughly 2× in wall-clock.** The tiled kernels skip any
+KV block lying entirely above the diagonal, touching only the lower-triangular
+half of the score space. Derived from the committed measurements, full-mask time
+divided by causal time runs 1.5–2.1× across sizes (the spread is run-to-run
+noise on a shared vCPU), against the 2.0× you would predict from halving the
+query–key pairs. Note this does *not* show up in the GFLOP/s tables, which
+already normalize it away by counting only unmasked pairs.
 
 ## AVX-512 (nightly)
 
@@ -98,10 +128,11 @@ worth measuring on the actual target part rather than assuming.
 ## Next steps
 
 - Multi-head batching (the outer loop that makes this a real layer).
-- A roofline plot: arithmetic intensity vs GFLOP/s, marking the compute-bound /
-  memory-bound crossover so it's visible, not just argued.
-- Sweep `BLOCK` per cache level; wire the AVX-512 kernel into the dispatch on a
-  nightly CI job.
+- Wire the AVX-512 kernel into the runtime dispatch, and measure it on a part
+  that actually has AVX-512.
+- Sweep `BLOCK` per cache level.
+- Attack the 17%-of-peak gap: the per-dot-product horizontal reduction is the
+  obvious first target.
 
 ## Layout
 
@@ -112,9 +143,12 @@ src/tiled.rs     online-softmax flash kernel with causal block-skipping
 src/simd.rs      AVX2+FMA intrinsics + vectorized exp + runtime dispatch
 src/vexp.rs      8-wide exp approximation
 src/avx512.rs    16-wide kernel, cfg-gated for nightly / Rust 1.89+
+src/roofline.rs  traffic model, measured machine ceilings, SVG writer
 src/bin/bench.rs standalone benchmark (both masks)
+src/bin/roofline.rs  regenerates docs/roofline.{svg,json}
 benches/         criterion harness
 tests/           correctness vs naive, both masks
+docs/            generated roofline figure + the data behind it
 ```
 
 ## License
