@@ -25,36 +25,44 @@ All kernels are verified bit-close to the naive reference, for both masks
 
 ## Results
 
-**AVX2 with a vectorized softmax runs 4.8–6.4× faster than the naive baseline.**
-Tiling on its own is worth another 1.2–1.5×, and causal block-skipping roughly
-halves wall-clock time. But the fastest kernel still reaches only ~17% of the
-machine's measured compute ceiling, and the roofline below shows why: at
+**AVX2 with a vectorized softmax runs roughly 4–5.5× faster than the naive
+baseline**, and **causal block-skipping is worth 2.0× wall-clock** against a
+theoretical ideal of exactly 2.0×. The fastest kernel still reaches only ~22% of
+the machine's measured compute ceiling, and the roofline below shows why: at
 `d = 64` this workload is compute-bound at every size tested, so the
 memory-traffic win that tiling exists for never gets to pay.
 
-Single core of an x86_64 machine with AVX2 + FMA (a shared VPS vCPU — hence
-modest absolute throughput; the *ratios* are the point), `head_dim = 64`, stable
-Rust with `-C target-cpu=native`. GFLOP/s counts only unmasked query–key pairs,
-so the two masks are directly comparable. Every number here and in the figure
-comes from one run of the committed generator.
+Single core of an x86_64 AMD EPYC with AVX2 + FMA (a shared VPS vCPU, pinned
+with `taskset` — hence modest absolute throughput; the *ratios* are the point),
+`head_dim = 64`, stable Rust with `-C target-cpu=native`. GFLOP/s counts only
+unmasked query–key pairs, so the two masks are directly comparable. The tables
+and the figure are one run of the committed generator, and `docs/roofline.json`
+is its raw output.
 
 **Full (bidirectional) mask**
 
 | n    | naive | tiled | simd  | simd speedup |
 |-----:|------:|------:|------:|-------------:|
-| 128  | 2.26  | 2.67  | 10.76 | **4.76×**    |
-| 256  | 2.15  | 3.18  | 12.04 | **5.61×**    |
-| 512  | 2.34  | 3.08  | 13.62 | **5.83×**    |
-| 1024 | 2.10  | 2.85  | 10.72 | **5.09×**    |
+| 128  | 3.47  | 2.86  | 17.19 | **4.95×**    |
+| 256  | 2.88  | 2.70  | 16.22 | **5.63×**    |
+| 512  | 2.93  | 2.40  | 15.38 | **5.26×**    |
+| 1024 | 2.77  | 2.24  | 14.11 | **5.10×**    |
 
 **Causal mask**
 
 | n    | naive | tiled | simd  | simd speedup |
 |-----:|------:|------:|------:|-------------:|
-| 128  | 2.01  | 2.70  | 11.10 | **5.53×**    |
-| 256  | 1.90  | 2.62  | 11.81 | **6.20×**    |
-| 512  | 1.69  | 2.60  | 10.47 | **6.19×**    |
-| 1024 | 1.79  | 2.71  | 11.45 | **6.41×**    |
+| 128  | 3.61  | 3.06  | 16.77 | **4.65×**    |
+| 256  | 3.42  | 2.67  | 17.06 | **4.98×**    |
+| 512  | 2.40  | 1.84  | 11.25 | **4.70×**    |
+| 1024 | 2.58  | 2.02  | 12.62 | **4.89×**    |
+
+**On reproducibility, since this is a shared vCPU.** The compute ceiling repeats
+to within 2.7% across seven independent runs (76.8–78.9 GFLOP/s), and the causal
+speedup lands on 2.01× mean against a 2.00× ideal. The kernel throughputs are
+looser: individual configurations move by up to ~20% run to run, so the speedup
+is stated as a range rather than to two decimals. Quoting "5.63×" as *the*
+number would not survive a rerun, and the range is the honest claim.
 
 ![Roofline: attention kernels against measured compute and bandwidth ceilings](docs/roofline.svg)
 
@@ -68,10 +76,19 @@ Reproduce with `RUSTFLAGS="-C target-cpu=native"`. The roofline binary measures
 both ceilings on whatever machine runs it, stamps the figure with that machine,
 and refuses to be quiet about it if the host was too contended to trust.
 
-Every timing is a median over 15–50 runs after warm-up, and every point carries
-its interquartile spread — in `docs/roofline.json` per point, and on the figure
-as the worst case across all of them. A median with no spread beside it cannot
-tell you whether a difference is real, so this reports both.
+**A note on how the timing works, because it changed the answer.** Kernels are
+not timed one exhaustively after another — they are interleaved round-robin, all
+six combinations of kernel and mask together, with the starting position rotating
+each round. Measured the old way, the baseline and the optimized kernel were
+sampled during different seconds of wall-clock, so on a shared vCPU the drift
+between those blocks landed entirely in their ratio: two back-to-back runs put
+the same speedup anywhere from 4.2× to 8.3×, with almost all the movement in the
+baseline rather than in `simd`. Interleaving makes it a paired comparison, and
+the causal measurement promptly converged from a physically impossible 1.45–3.10×
+onto 2.01× mean. Throughput is reported from the fastest run rather than the
+median, because interference is one-sided — it can only ever make a run slower.
+Every point also carries its interquartile spread, per point in the JSON and
+worst-case on the figure.
 
 ## What the numbers say
 
@@ -102,11 +119,14 @@ moving the points vertically rather than horizontally. Most of it is the
 per-score scalar `exp` with an 8-wide polynomial (`src/vexp.rs`), which had been
 the binding constraint on the softmax.
 
-**And there is still 5× left on the table.** The best kernel reaches 13.6 of
-78 GFLOP/s — about 17% of measured peak. The gap is the horizontal reduction at
-the tail of every dot product, the scalar softmax bookkeeping between blocks,
-and per-block loop overhead, none of which vectorize. That is a roofline
-argument for where to look next, not a mystery.
+**And there is still 4.5× left on the table.** The best kernel reaches 17.2 of
+78.9 GFLOP/s — about 22% of measured peak. That ceiling is itself worth trusting:
+it comes from a dependency-free FMA probe, repeats to 2.7% across seven runs, and
+works out to ~100% of what two 256-bit FMA ports can retire at this core's clock,
+so it is a real ceiling rather than a round number. The remaining gap is the
+horizontal reduction at the tail of every dot product, the scalar softmax
+bookkeeping between blocks, and per-block loop overhead, none of which vectorize.
+That is a roofline argument for where to look next, not a mystery.
 
 **Causal block-skipping pays, and the GFLOP/s tables cannot show it.** Those
 tables divide by a causal-aware FLOP count, which normalizes the halved work

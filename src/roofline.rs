@@ -332,35 +332,42 @@ pub fn measure_points() -> Vec<Point> {
     let d = HEAD_DIM;
     let mut pts = Vec::new();
 
-    for &causal in &[false, true] {
-        for &n in &SEQ_LENS {
-            let q = filled(n, d, 1);
-            let k = filled(n, d, 2);
-            let v = filled(n, d, 3);
+    for &n in &SEQ_LENS {
+        let q = filled(n, d, 1);
+        let k = filled(n, d, 2);
+        let v = filled(n, d, 3);
+        let iters = if n <= 256 { 50 } else { 15 };
+
+        // All six measurements for this size are interleaved together: three
+        // kernels crossed with both masks. Interleaving only the kernels would
+        // still leave the full-vs-causal comparison measured in separate
+        // blocks, and that ratio is a headline claim too — it would absorb
+        // machine drift exactly the way the kernel ratio used to.
+        let mut nf = || drop(naive::attention(&q, &k, &v, false));
+        let mut tf = || drop(tiled::attention(&q, &k, &v, false));
+        let mut sf = || drop(simd::attention(&q, &k, &v, false));
+        let mut nc = || drop(naive::attention(&q, &k, &v, true));
+        let mut tc = || drop(tiled::attention(&q, &k, &v, true));
+        let mut sc = || drop(simd::attention(&q, &k, &v, true));
+        let timings = time_interleaved(
+            &mut [&mut nf, &mut tf, &mut sf, &mut nc, &mut tc, &mut sc],
+            iters,
+        );
+
+        for (i, t) in timings.iter().enumerate() {
+            let causal = i >= KERNELS.len();
+            let kernel = KERNELS[i % KERNELS.len()];
             let flops = attention_flops(n, d, causal);
-            let iters = if n <= 256 { 50 } else { 15 };
-
-            // Interleaved, not one kernel exhaustively after another: the
-            // speedup between them is the headline number, and measuring the
-            // baseline and the optimized kernel in separate blocks lets machine
-            // drift land entirely in that ratio.
-            let mut f_naive = || drop(naive::attention(&q, &k, &v, causal));
-            let mut f_tiled = || drop(tiled::attention(&q, &k, &v, causal));
-            let mut f_simd = || drop(simd::attention(&q, &k, &v, causal));
-            let timings = time_interleaved(&mut [&mut f_naive, &mut f_tiled, &mut f_simd], iters);
-
-            for (&kernel, t) in KERNELS.iter().zip(&timings) {
-                pts.push(Point {
-                    kernel,
-                    n,
-                    causal,
-                    gflops: flops / t.best / 1e9,
-                    intensity: flops / bytes_moved(kernel, n, d, causal),
-                    best_secs: t.best,
-                    median_secs: t.median,
-                    spread_pct: t.spread_pct,
-                });
-            }
+            pts.push(Point {
+                kernel,
+                n,
+                causal,
+                gflops: flops / t.best / 1e9,
+                intensity: flops / bytes_moved(kernel, n, d, causal),
+                best_secs: t.best,
+                median_secs: t.median,
+                spread_pct: t.spread_pct,
+            });
         }
     }
     pts
