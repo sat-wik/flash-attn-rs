@@ -117,3 +117,76 @@ pub unsafe fn exp16(x: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
 
     _mm512_mul_ps(p, pow2k)
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    /// `exp8` is only exercised indirectly by the attention tests, over whatever
+    /// score range the fixtures happen to produce. This pins its accuracy
+    /// directly, across the range softmax actually uses and past the edges of it.
+    #[test]
+    fn exp8_matches_libm() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            eprintln!("SKIPPED: no AVX2+FMA on this CPU");
+            return;
+        }
+        use std::arch::x86_64::*;
+
+        // Softmax only ever calls this on x <= 0, but the approximation should
+        // hold either side of zero.
+        let mut xs: Vec<f32> = Vec::new();
+        let mut x = -40.0f32;
+        while x <= 10.0 {
+            xs.push(x);
+            x += 0.013;
+        }
+        while xs.len() % 8 != 0 {
+            xs.push(0.0);
+        }
+
+        let mut worst = 0.0f32;
+        for chunk in xs.chunks_exact(8) {
+            let out = unsafe {
+                let v = _mm256_loadu_ps(chunk.as_ptr());
+                let e = super::exp8(v);
+                let mut buf = [0.0f32; 8];
+                _mm256_storeu_ps(buf.as_mut_ptr(), e);
+                buf
+            };
+            for (&xi, &got) in chunk.iter().zip(&out) {
+                let want = xi.exp();
+                let rel = (got - want).abs() / want.max(f32::MIN_POSITIVE);
+                if rel > worst {
+                    worst = rel;
+                }
+            }
+        }
+
+        // Range reduction leaves |r| <= ln2/2, where the degree-5 polynomial's
+        // truncation error is about r^6/720 ~ 2e-6 relative. 1e-5 leaves room
+        // for f32 rounding in the exponent assembly without being vacuous.
+        assert!(worst < 1e-5, "worst relative error {worst:e}");
+    }
+
+    /// Clamping must hold at the extremes rather than producing NaN or a
+    /// wrapped exponent field.
+    #[test]
+    fn exp8_saturates_cleanly() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use std::arch::x86_64::*;
+        let xs = [-1e30f32, -200.0, -88.0, 0.0, 88.0, 200.0, 1e30, -0.0];
+        let out = unsafe {
+            let e = super::exp8(_mm256_loadu_ps(xs.as_ptr()));
+            let mut buf = [0.0f32; 8];
+            _mm256_storeu_ps(buf.as_mut_ptr(), e);
+            buf
+        };
+        for (&xi, &got) in xs.iter().zip(&out) {
+            assert!(got.is_finite(), "exp8({xi}) = {got}");
+            assert!(got >= 0.0, "exp8({xi}) = {got} is negative");
+        }
+        // exp(0) must be exact, since softmax leans on the max element being 1.
+        assert!((out[3] - 1.0).abs() < 1e-6, "exp8(0) = {}", out[3]);
+    }
+}

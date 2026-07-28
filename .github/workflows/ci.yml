@@ -36,8 +36,23 @@ jobs:
       - name: cargo test
         run: cargo test --release
 
+      # The AVX-512 module builds on stable since 1.89, so it belongs in the
+      # blocking job rather than only in the advisory nightly one below —
+      # otherwise it could break and nothing would fail. Whether the kernel
+      # actually executes still depends on the runner; the dispatch feature-tests
+      # at runtime and the correctness test skips itself when AVX-512F is absent.
+      - name: cargo clippy (--cfg avx512)
+        env:
+          RUSTFLAGS: --cfg avx512
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (--cfg avx512)
+        env:
+          RUSTFLAGS: --cfg avx512
+        run: cargo test --release
+
   nightly-avx512:
-    name: nightly — avx512 build + test
+    name: nightly — toolchain drift check
     runs-on: ubuntu-latest
     # Advisory only: nightly toolchain drift must not block the repo.
     continue-on-error: true
@@ -48,10 +63,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
 
-      # Whether the AVX-512 kernel actually executes depends on the runner, and
-      # GitHub does not guarantee a particular CPU. Print what we got, so a green
-      # check can be read correctly: with avx512f the kernel really ran, without
-      # it only the fallback did.
+      # The stable job above is what guards this code; this one is an early
+      # warning that a nightly change is coming for it. Print the runner CPU so
+      # a green check can be read correctly: with avx512f the kernel really ran,
+      # without it only the fallback did.
       - name: runner AVX-512 support
         run: |
           # Note: `grep ... | sort || echo` would never reach the echo, since the

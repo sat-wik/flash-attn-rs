@@ -1,3 +1,15 @@
+//! Criterion harness, for per-kernel distribution statistics.
+//!
+//! Note what this is *not* good for. Criterion benchmarks each kernel
+//! independently, one after another, which is exactly the measurement shape
+//! `docs/measurement.md` documents going wrong on a shared host: the ratio
+//! between two kernels measured in separate blocks absorbs whatever the machine
+//! did between them. Use `--bin bench` or `--bin roofline` for anything where
+//! the comparison is the point — those interleave and pair.
+//!
+//! What criterion gives that the hand-rolled tooling does not is a proper
+//! sampling distribution per kernel, outlier classification and HTML reports.
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use flash_attn_rs::{attention_flops, filled, naive, simd, tiled};
 

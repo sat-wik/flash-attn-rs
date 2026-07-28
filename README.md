@@ -5,7 +5,8 @@
 Attention kernels in Rust, written to make the *hardware reason* for each
 speedup measurable rather than asserted. Three implementations of the same math
 — a naive baseline, the Flash Attention tiling algorithm, and an AVX2 version —
-plotted against the machine's measured roofline. Zero dependencies.
+plotted against the machine's measured roofline. No runtime dependencies —
+`criterion` is the only entry in the manifest and it is dev-only.
 
 ## Results
 
@@ -124,23 +125,24 @@ capacity curve has. A 128-row tile spans exactly 32 KB of K at `d = 64`, and
 power-of-two strides are the classic way to land every row in one cache set —
 but that is a hypothesis, not a finding.
 
-## AVX-512 (nightly)
+## AVX-512 (opt-in)
 
 `src/avx512.rs` carries the full 16-wide kernel — same online-softmax
 bookkeeping and causal block-skipping over `_mm512_*`, with a hardware
 `_mm512_reduce_add_ps` and a 16-wide `exp` — wired into `simd::attention`'s
-dispatch ahead of the AVX2 arm. It is gated because `_mm512_*` only stabilized in
-Rust 1.89 and the default build targets an older floor.
+dispatch ahead of the AVX2 arm. It is behind a cfg because `_mm512_*` only
+stabilized in Rust 1.89 while the default build targets an older floor; on a
+current toolchain it needs no nightly.
 
 ```
-RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo +nightly build --release
+RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo build --release
 ```
 
-**No numbers here, because no machine I have access to has AVX-512.** It is
-compiled, lint-clean and tested in CI, but the correctness test skips itself
-rather than pretend to cover a path it never ran. Expected is **sub-2×** over
-AVX2 — the reduction and the scalar softmax tail do not widen, and some parts
-down-clock under sustained AVX-512 load. Projected, not observed.
+**No numbers here, because no machine I have access to has AVX-512.** CI builds,
+lints and tests it on stable, but the correctness test skips itself rather than
+pretend to cover a path it never ran. Expected is **sub-2×** over AVX2 — the
+reduction and the scalar softmax tail do not widen, and some parts down-clock
+under sustained AVX-512 load. Projected, not observed.
 
 ## Layout
 

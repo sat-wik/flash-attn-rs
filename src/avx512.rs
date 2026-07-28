@@ -1,17 +1,17 @@
 //! AVX-512 path — 16 f32 lanes per instruction, double the AVX2 width.
 //!
-//! AVX-512 intrinsics (`_mm512_*`) were stabilized in Rust 1.89. On older
-//! toolchains they live behind the unstable `stdsimd` feature, so this whole
-//! module is gated on a `avx512` cfg flag you opt into explicitly:
+//! AVX-512 intrinsics (`_mm512_*`) were stabilized in Rust 1.89, above this
+//! crate's declared MSRV, so the module is gated on an `avx512` cfg you opt into
+//! explicitly. No nightly needed on a current toolchain:
 //!
 //! ```text
-//! RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo +nightly build --release
+//! RUSTFLAGS="-C target-cpu=native --cfg avx512" cargo build --release
 //! ```
 //!
-//! Gating it this way keeps the default `cargo build`/`cargo test` green on
-//! stable while the code stays present and reviewable. The dispatch in
-//! `simd::attention` would add an `is_x86_feature_detected!("avx512f")` arm in
-//! front of the AVX2 one when this cfg is active.
+//! Gating it this way keeps the default build on the lower floor while the code
+//! stays present, reviewable and covered — CI lints and tests it under the cfg
+//! on stable. `simd::attention` adds an `is_x86_feature_detected!("avx512f")`
+//! arm ahead of the AVX2 one when the cfg is active.
 //!
 //! Design note: the interesting measurement here isn't just "2× the lanes." The
 //! per-block reduction and the scalar softmax tail don't get wider, so the

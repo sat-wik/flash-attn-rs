@@ -313,3 +313,101 @@ unsafe fn scale_avx2(out: &mut [f32], s: f32) {
         t += 1;
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use crate::filled;
+
+    fn has_avx2() -> bool {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    }
+
+    /// `dot4_avx2` folds four accumulators through a nest of `hadd`s that relies
+    /// on which lanes each one leaves its partial sums in. That is easy to get
+    /// subtly wrong — a transposed pair would still produce plausible-looking
+    /// attention output — so check it against the one-at-a-time version directly
+    /// rather than trusting the end-to-end test to notice.
+    #[test]
+    fn dot4_matches_dot() {
+        if !has_avx2() {
+            eprintln!("SKIPPED: no AVX2+FMA on this CPU");
+            return;
+        }
+        // Lengths either side of the 8-wide body: exact multiples, a short
+        // vector, and ragged tails.
+        for &len in &[1usize, 7, 8, 9, 15, 16, 63, 64, 65, 128] {
+            let a = filled(1, len, 1);
+            let b = filled(4, len, 2);
+            let got = unsafe { dot4_avx2(a.row(0), b.row(0), b.row(1), b.row(2), b.row(3)) };
+            for (lane, &g) in got.iter().enumerate() {
+                let want = unsafe { dot_avx2(a.row(0), b.row(lane)) };
+                let diff = (g - want).abs();
+                let tol = 1e-4 * want.abs().max(1.0);
+                assert!(
+                    diff < tol,
+                    "len={len} lane={lane}: dot4 {g} vs dot {want} (diff {diff:e})"
+                );
+            }
+        }
+    }
+
+    /// The four lanes must stay in key order. A test that used the same data for
+    /// every row would pass even if the fold shuffled them.
+    #[test]
+    fn dot4_preserves_lane_order() {
+        if !has_avx2() {
+            return;
+        }
+        let a = crate::Mat {
+            rows: 1,
+            cols: 8,
+            data: vec![1.0; 8],
+        };
+        // Each row sums to a distinct value, so a permuted fold is visible.
+        let mut b = crate::Mat::zeros(4, 8);
+        for r in 0..4 {
+            for t in 0..8 {
+                b.row_mut(r)[t] = if t == 0 { (r + 1) as f32 } else { 0.0 };
+            }
+        }
+        let got = unsafe { dot4_avx2(a.row(0), b.row(0), b.row(1), b.row(2), b.row(3)) };
+        assert_eq!(got, [1.0, 2.0, 3.0, 4.0], "lanes came back out of order");
+    }
+
+    /// `accumulate_avx2` interchanges the loops and keeps the output row in
+    /// registers, which changes both the traversal order and the summation
+    /// order. Check it against the obvious per-key form.
+    #[test]
+    fn accumulate_matches_per_key_axpy() {
+        if !has_avx2() {
+            return;
+        }
+        // d values chosen to hit every path: below one 32-float chunk, exactly
+        // one, one plus a ragged tail, and two whole chunks.
+        for &d in &[8usize, 17, 32, 49, 64, 96] {
+            for &(kv0, jhi) in &[(0usize, 1usize), (0, 7), (0, 64), (3, 20), (11, 12)] {
+                let v = filled(jhi.max(1), d, 5);
+                let probs: Vec<f32> = (0..64).map(|i| 0.25 + (i as f32) * 0.01).collect();
+                let start = filled(1, d, 9);
+
+                let mut got = start.row(0).to_vec();
+                unsafe { accumulate_avx2(&mut got, &v, kv0, jhi, &probs) };
+
+                let mut want = start.row(0).to_vec();
+                for (bj, j) in (kv0..jhi).enumerate() {
+                    unsafe { axpy_avx2(&mut want, v.row(j), probs[bj]) };
+                }
+
+                for (t, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    let diff = (g - w).abs();
+                    let tol = 1e-4 * w.abs().max(1.0);
+                    assert!(
+                        diff < tol,
+                        "d={d} kv0={kv0} jhi={jhi} t={t}: {g} vs {w} (diff {diff:e})"
+                    );
+                }
+            }
+        }
+    }
+}
