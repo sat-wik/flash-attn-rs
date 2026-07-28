@@ -78,6 +78,50 @@ pub unsafe fn axpy_avx512(out: &mut [f32], v: &[f32], p: f32) {
     }
 }
 
+/// `out += sum_j probs[j] * V[j]` over one KV block, with the output row held in
+/// registers across the block. The 16-wide counterpart of `simd::accumulate_avx2`
+/// — same loop interchange, same reason: one `axpy` per key reloads and restores
+/// the whole output row every time, and that traffic is loop structure rather
+/// than arithmetic. 64-float chunks give four zmm accumulators.
+///
+/// # Safety
+///
+/// The caller must have established that the CPU supports AVX-512F.
+#[target_feature(enable = "avx512f")]
+pub unsafe fn accumulate_avx512(oi: &mut [f32], v: &Mat, kv0: usize, jhi: usize, probs: &[f32]) {
+    use std::arch::x86_64::*;
+    let d = oi.len();
+    let mut base = 0;
+
+    while base + 64 <= d {
+        let mut a0 = _mm512_loadu_ps(oi.as_ptr().add(base));
+        let mut a1 = _mm512_loadu_ps(oi.as_ptr().add(base + 16));
+        let mut a2 = _mm512_loadu_ps(oi.as_ptr().add(base + 32));
+        let mut a3 = _mm512_loadu_ps(oi.as_ptr().add(base + 48));
+
+        for (bj, j) in (kv0..jhi).enumerate() {
+            let vp = _mm512_set1_ps(probs[bj]);
+            let vr = v.row(j).as_ptr().add(base);
+            a0 = _mm512_fmadd_ps(vp, _mm512_loadu_ps(vr), a0);
+            a1 = _mm512_fmadd_ps(vp, _mm512_loadu_ps(vr.add(16)), a1);
+            a2 = _mm512_fmadd_ps(vp, _mm512_loadu_ps(vr.add(32)), a2);
+            a3 = _mm512_fmadd_ps(vp, _mm512_loadu_ps(vr.add(48)), a3);
+        }
+
+        _mm512_storeu_ps(oi.as_mut_ptr().add(base), a0);
+        _mm512_storeu_ps(oi.as_mut_ptr().add(base + 16), a1);
+        _mm512_storeu_ps(oi.as_mut_ptr().add(base + 32), a2);
+        _mm512_storeu_ps(oi.as_mut_ptr().add(base + 48), a3);
+        base += 64;
+    }
+
+    if base < d {
+        for (bj, j) in (kv0..jhi).enumerate() {
+            axpy_avx512(&mut oi[base..], &v.row(j)[base..], probs[bj]);
+        }
+    }
+}
+
 /// out *= s, 16-wide.
 ///
 /// # Safety
@@ -186,13 +230,8 @@ pub unsafe fn attention(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
                 }
 
                 // out += sum_j probs_j * V_j, and accumulate the normalizer.
-                let oi = out.row_mut(i);
-                let mut lsum = 0.0f32;
-                for (bj, j) in (kv0..jhi).enumerate() {
-                    let p = probs[bj];
-                    lsum += p;
-                    axpy_avx512(oi, v.row(j), p);
-                }
+                let lsum: f32 = probs[..valid].iter().sum();
+                accumulate_avx512(out.row_mut(i), v, kv0, jhi, &probs);
                 l[i] += lsum;
                 m[i] = m_new;
             }

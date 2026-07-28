@@ -126,12 +126,8 @@ unsafe fn attention_avx2(q: &Mat, k: &Mat, v: &Mat, causal: bool) -> Mat {
                 }
 
                 // Accumulate l and out = out + sum_j probs_j * V_j.
-                let mut lsum = 0.0f32;
-                for (bj, j) in (kv0..jhi).enumerate() {
-                    let p = probs[bj];
-                    lsum += p;
-                    axpy_avx2(oi, v.row(j), p);
-                }
+                let lsum: f32 = probs[..valid].iter().sum();
+                accumulate_avx2(oi, v, kv0, jhi, &probs);
                 l[i] += lsum;
                 m[i] = m_new;
             }
@@ -223,6 +219,62 @@ unsafe fn dot4_avx2(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -
         t += 1;
     }
     out
+}
+
+/// `out += Σ_j probs[j] · V[j]` over one KV block, holding the output row in
+/// registers for the whole block.
+///
+/// The obvious loop is one `axpy` per key, and that reloads and restores the
+/// entire output row every time: at `d = 64` it is 8 loads and 8 stores of `out`
+/// per key, on top of the 8 loads of `V` that are actually unavoidable. The
+/// output traffic is pure loop structure — the same 64 floats going out to L1
+/// and back for every key in the block.
+///
+/// Interchanging the loops fixes it. Walking `out` in 32-float chunks and
+/// putting the key loop *inside* means four accumulators stay in registers
+/// across every key in the block, and `out` is touched once at each end. Only
+/// `V` is streamed, which is the part that genuinely has to move.
+///
+/// Chunk width is 32 rather than 64 so `d = 32` benefits too and register
+/// pressure stays low: four accumulators plus a broadcast and a load is six of
+/// sixteen ymm registers. `V` is re-read once per chunk, but a block of it is
+/// 16 KB at the default tile size and sits in L1, so that costs far less than
+/// the output traffic it removes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn accumulate_avx2(oi: &mut [f32], v: &Mat, kv0: usize, jhi: usize, probs: &[f32]) {
+    use std::arch::x86_64::*;
+    let d = oi.len();
+    let mut base = 0;
+
+    while base + 32 <= d {
+        let mut a0 = _mm256_loadu_ps(oi.as_ptr().add(base));
+        let mut a1 = _mm256_loadu_ps(oi.as_ptr().add(base + 8));
+        let mut a2 = _mm256_loadu_ps(oi.as_ptr().add(base + 16));
+        let mut a3 = _mm256_loadu_ps(oi.as_ptr().add(base + 24));
+
+        for (bj, j) in (kv0..jhi).enumerate() {
+            let vp = _mm256_set1_ps(probs[bj]);
+            let vr = v.row(j).as_ptr().add(base);
+            a0 = _mm256_fmadd_ps(vp, _mm256_loadu_ps(vr), a0);
+            a1 = _mm256_fmadd_ps(vp, _mm256_loadu_ps(vr.add(8)), a1);
+            a2 = _mm256_fmadd_ps(vp, _mm256_loadu_ps(vr.add(16)), a2);
+            a3 = _mm256_fmadd_ps(vp, _mm256_loadu_ps(vr.add(24)), a3);
+        }
+
+        _mm256_storeu_ps(oi.as_mut_ptr().add(base), a0);
+        _mm256_storeu_ps(oi.as_mut_ptr().add(base + 8), a1);
+        _mm256_storeu_ps(oi.as_mut_ptr().add(base + 16), a2);
+        _mm256_storeu_ps(oi.as_mut_ptr().add(base + 24), a3);
+        base += 32;
+    }
+
+    // Whatever is left over keeps the per-key form; at d = 64 there is none.
+    if base < d {
+        for (bj, j) in (kv0..jhi).enumerate() {
+            axpy_avx2(&mut oi[base..], &v.row(j)[base..], probs[bj]);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
