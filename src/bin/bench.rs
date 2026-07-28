@@ -122,6 +122,18 @@ fn multihead() {
         .map(|c| c.get())
         .unwrap_or(1);
     println!("\n=== multi-head, n = {n}, d = {d}, {cores} logical cores ===");
+    if cores < 2 {
+        // available_parallelism() honours CPU affinity, so `taskset -c 0` makes
+        // this report 1 and attention_parallel falls straight back to the serial
+        // path. The two columns would then be the same code measured twice.
+        println!(
+            "\nOnly one core is available to this process, so there is nothing to\n\
+             parallelize across and the two columns below run identical code.\n\
+             If you pinned with `taskset -c 0`, re-run this benchmark unpinned\n\
+             (or pin to a range, e.g. `taskset -c 0-7`) to measure head scaling.\n\
+             The gap between the columns is then a useful read on the noise floor."
+        );
+    }
     println!(
         "{:>6}  {:>13}  {:>15}  {:>10}  {:>12}",
         "heads", "serial (ms)", "parallel (ms)", "speedup", "vs ideal"
