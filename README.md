@@ -25,16 +25,17 @@ All kernels are verified bit-close to the naive reference, for both masks
 
 ## Results
 
-**AVX2 with a vectorized softmax runs roughly 5–8× faster than the naive
-baseline**, and **causal block-skipping is worth 2.0× wall-clock** against a
-theoretical ideal of exactly 2.0×. **Tiling on its own is a net loss** — 0.65–1.02×,
-i.e. slower than the baseline it replaces. The fastest kernel reaches 32% of the
-machine's measured compute ceiling.
+**AVX2 runs 10–14× faster than the naive baseline** and reaches **41% of the
+machine's measured compute ceiling**. **Causal block-skipping is worth 2.0×
+wall-clock** against a theoretical ideal of exactly 2.0×. **Tiling on its own
+buys nothing measurable.**
 
 The roofline below explains all three at once: at `d = 64` this workload is
 compute-bound at every size tested, so an optimization that only removes memory
 traffic has nothing to buy, and one that issues better instructions has
-everything to.
+everything to. Two changes found that way — amortizing the dot-product reduction
+and holding the output row in registers across a block — took the kernel from
+22% to 41% of peak.
 
 Single core of an x86_64 AMD EPYC with AVX2 + FMA (a shared VPS vCPU, pinned
 with `taskset` — hence modest absolute throughput; the *ratios* are the point),
@@ -47,28 +48,29 @@ is its raw output.
 
 | n    | naive | tiled | simd  | simd speedup |
 |-----:|------:|------:|------:|-------------:|
-| 128  | 2.73  | 2.28  | 16.73 | **6.12×**    |
-| 256  | 2.94  | 2.73  | 23.59 | **8.01×**    |
-| 512  | 2.74  | 2.74  | 18.40 | **6.73×**    |
-| 1024 | 2.77  | 2.34  | 19.18 | **6.93×**    |
+| 128  | 3.02  | 3.53  | 32.53 | **10.76×**   |
+| 256  | 2.65  | 3.46  | 31.67 | **11.94×**   |
+| 512  | 2.37  | 2.78  | 29.84 | **12.61×**   |
+| 1024 | 2.43  | 2.59  | 27.64 | **11.38×**   |
 
 **Causal mask**
 
 | n    | naive | tiled | simd  | simd speedup |
 |-----:|------:|------:|------:|-------------:|
-| 128  | 3.41  | 2.21  | 16.39 | **4.80×**    |
-| 256  | 3.31  | 2.65  | 24.72 | **7.48×**    |
-| 512  | 2.83  | 2.87  | 21.75 | **7.68×**    |
-| 1024 | 2.74  | 2.43  | 18.58 | **6.79×**    |
+| 128  | 2.98  | 3.50  | 30.65 | **10.30×**   |
+| 256  | 2.68  | 3.14  | 30.60 | **11.42×**   |
+| 512  | 2.74  | 2.84  | 30.87 | **11.28×**   |
+| 1024 | 2.12  | 2.72  | 29.64 | **13.99×**   |
 
 **On reproducibility, since this is a shared vCPU.** The compute ceiling repeats
-to within a few percent across nine independent runs (74–79 GFLOP/s), and
+to within a few percent across ten independent runs (74–79 GFLOP/s), and
 re-measuring it *after* all the kernel timings puts the drift across this run at
-0.5% — so the points and the ceiling they are plotted against were measured on a
-machine that held still. Point spreads are 3–17% (median 8%). The causal speedup
-lands on 2.02× mean against a 2.00× ideal. Kernel throughputs are the loosest
-quantity here, so the speedup is a range rather than a decimal: quoting "8.01×"
-as *the* number would not survive a rerun.
+1.4% — so the points and the ceiling they are plotted against were measured on a
+machine that held still. A second run of the same binary reproduces `simd` to
+within 2% at five of eight configurations and 16% at the worst. The causal
+speedup lands on 2.0× mean against a 2.00× ideal. Speedups are quoted as a range
+because that is what the hardware supports: "12.61×" as *the* number would not
+survive a rerun.
 
 ![Roofline: attention kernels against measured compute and bandwidth ceilings](docs/roofline.svg)
 
@@ -102,49 +104,59 @@ worst-case on the figure.
 
 **Everything here is compute-bound, and that is the whole story.** The ridge
 point on this machine — where the bandwidth ceiling crosses the compute ceiling
-— sits at 5.11 FLOP/byte. Every kernel at every size lands to the *right* of it,
+— sits at 5.18 FLOP/byte. Every kernel at every size lands to the *right* of it,
 between 8 and 30 FLOP/byte. Nothing in this workload is waiting on memory, so
 moving fewer bytes cannot be the lever that makes it faster. That single fact
 predicts the rest of the table.
 
-**Which is why tiling does not merely fail to help — it costs.** Flash Attention
-exists to avoid materializing the `[n×n]` score matrix, cutting traffic from
-O(n²) to O(n·d). The figure shows it doing exactly that: the tiled points sit at
-roughly twice the arithmetic intensity of the naive ones, shifted a full step
-right. And they sit at the *same height or lower*. Measured, tiling runs at
-0.65–1.02× of naive — a net loss at seven of eight configurations.
+**Which is why tiling buys nothing — and why I cannot tell you its sign.**
+Flash Attention exists to avoid materializing the `[n×n]` score matrix, cutting
+traffic from O(n²) to O(n·d). The figure shows it doing exactly that: the tiled
+points sit at roughly twice the arithmetic intensity of the naive ones, shifted
+a full step right. And they sit at essentially the *same height*.
 
-That is the expected outcome once you accept the first paragraph. Moving right
-along a flat ceiling buys nothing, and the online-softmax rescale is not free:
-every block that raises a row's running max costs a pass over the accumulator to
-correct it. Pay a real cost for a benefit the hardware cannot cash, and you lose.
+How much the same is a genuinely open question here. Across ten runs the
+tiled-to-naive ratio has come out 0.65×, 0.78×, 0.82×, 0.93×, 1.02×, 1.07×,
+1.17×, 1.31×, 1.48× — with no change to either kernel's source, and 9–23%
+spread on each measurement individually. The effect is smaller than the noise
+that surrounds it. Two earlier revisions of this README confidently claimed a
+direction, once each way, and both were over-reading a pair of runs that
+happened to agree.
+
+So the honest claim is a null result: **tiling makes no reliable difference at
+this `n` and `d` on this machine.** That is exactly what the roofline predicts.
+Moving right along a flat ceiling cannot buy throughput, so an optimization that
+only removes memory traffic should do nothing, and nothing is what ten runs
+show.
 
 **This is the honest negative result, and it is the most interesting thing
 here.** The optimization is correctly implemented — `tests/correctness.rs` holds
 it to 1e-4 against the reference at five tile sizes — and simply mis-targeted at
-this `n` and `d` on this machine. Flash's real win needs larger `n`, smaller
-cache, or the HBM-bandwidth-bound GPU regime it was designed for. Knowing which
-side of the ridge you are on before you optimize is the entire point.
+this `n` and `d`. Flash's real win needs larger `n`, smaller cache, or the
+HBM-bandwidth-bound GPU regime it was designed for. Knowing which side of the
+ridge you are on before you optimize is the entire point of the exercise.
 
-An earlier revision of this README claimed tiling *won* 1.2–1.5×. That came from
-a single unpinned, non-interleaved run — the same measurement setup that also
-put the AVX2 speedup anywhere between 4.2× and 8.3×. Every run since, pinned and
-paired, has tiling losing. The number changed because the methodology got
-fixed, which is worth stating out loud rather than quietly correcting.
+One loose end worth naming rather than hiding: the sign of that ratio correlates
+suspiciously well with which commit was built, even though the commits in
+question touched only `simd.rs` and never `naive.rs` or `tiled.rs`. Runs before
+the accumulate change put tiling below naive; both runs after put it above. Four
+runs is not enough to call that real, and there is no mechanism I can point to —
+but if it is real, it means the interleaved sampler perturbs the very
+measurements it exists to protect, and that would be worth knowing.
 
 **Vectorization is the lever that actually applies.** Being compute-bound means
-the way up is issuing better instructions, and that is what AVX2 does — roughly
-5–8×, moving the points vertically rather than horizontally. Most of it is the
+the way up is issuing better instructions, and that is what AVX2 does — 10–14×,
+moving the points vertically rather than horizontally. Most of it is the
 8-wide dot product and accumulate. Two further steps came from following the
 roofline rather than guessing: replacing the per-score scalar `exp` with an
 8-wide polynomial (`src/vexp.rs`), which had been the binding constraint on the
 softmax, and then amortizing the dot-product reduction (`dot4_avx2`) — see
 below.
 
-**The roofline said where to cut, and cutting there worked.**
-The best kernel reaches 24.7 of 76.6 GFLOP/s, about 32% of measured peak — up
-from 22% before the reduction change below, a mean gain of 46% across all
-twenty-four configurations. That
+**The roofline said where to cut, twice, and both cuts worked.**
+The best kernel reaches 32.5 of 78.5 GFLOP/s, about 41% of measured peak — up
+from 22% before the two changes below, which are the only optimizations in this
+project chosen by measurement rather than intuition. That
 ceiling is worth trusting: a dependency-free FMA probe, repeatable to 2.7% across
 seven runs, working out to ~100% of what two 256-bit FMA ports can retire at this
 core's clock. So the gap is real, and it is not in the FMAs — it is in everything
@@ -159,13 +171,25 @@ one 128-bit fold — because `hadd` interleaves two sources, `hadd(hadd(a,b),
 hadd(c,d))` leaves all four partial sums in known lanes. Roughly a quarter of the
 reduction work per key.
 
-That single change is worth more than everything else in this section combined,
-and it was not a guess — the figure identified non-FMA work as the whole gap,
-and the reduction was the largest such item. The remaining ~3× is the scalar
-softmax bookkeeping between blocks and the `axpy` accumulate, which re-reads the
-output row once per key rather than holding it in registers across the block.
-Both are visible the same way the reduction was: work that scales with query-key
-pairs and never touches an FMA port.
+Measured, that was worth a **mean 46%** across all twenty-four configurations.
+
+The second was the **accumulate**. The obvious loop runs one `axpy` per key,
+which reloads and restores the whole output row every time: at `d = 64`, eight
+loads and eight stores of `out` per key on top of the eight loads of `V` that
+genuinely have to happen. Interchanging the loops — walking `out` in 32-float
+chunks with the key loop inside — keeps four accumulators in registers across
+the whole block, so `out` is touched once at each end and only `V` streams.
+
+That was worth another **mean 53%**, more than the reduction, and part of why is
+not about traffic at all: every `axpy` had to store `out` and reload it before
+the next key could touch the same address, putting store-to-load latency in the
+critical path once per key. Register accumulators turn that dependency chain
+into independent FMAs the scheduler can overlap.
+
+What is left is the scalar softmax bookkeeping between blocks — the running max
+and normalizer, and the `exp` on the block tail that is not a multiple of eight.
+Same signature as the other two: work that scales with query-key pairs and never
+touches an FMA port.
 
 **Causal block-skipping pays, and the GFLOP/s tables cannot show it.** Those
 tables divide by a causal-aware FLOP count, which normalizes the halved work
